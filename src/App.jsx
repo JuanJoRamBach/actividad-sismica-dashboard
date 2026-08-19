@@ -4,7 +4,7 @@ import {
   PieChart, Pie, Cell, XAxis, YAxis, ZAxis, CartesianGrid, Tooltip, Legend,
   ResponsiveContainer,
 } from "recharts";
-import { geoMercator, geoPath, geoContains } from "d3-geo";
+import { geoMercator, geoPath, geoContains, geoArea } from "d3-geo";
 import { STRINGS, detectLang } from "./i18n.js";
 
 /* ---------------------------------------------------------------------- */
@@ -171,7 +171,52 @@ async function fetchBoundary(iso3, level) {
   }
   const geomRes = await fetch(finalUrl);
   if (!geomRes.ok) throw new Error("geom");
-  return await geomRes.json();
+  const gj = await geomRes.json();
+  return fixRingWinding(gj);
+}
+
+/* geoBoundaries' ADM0 files ship with every disjoint ring (mainland, each island)  */
+/* wound clockwise — the opposite of GeoJSON's right-hand-rule spec, which d3-geo   */
+/* follows strictly. A backwards ring reads to d3 as "the entire globe except this  */
+/* landmass", so fitSize (and geoBounds/geoArea generally) zooms out to near-planet */
+/* scale instead of the country. Confirmed empirically: Chile's ADM0 has 163 rings, */
+/* and d3.geoArea(whole file) ≈ 163 × 4π steradians — i.e. every single ring reads  */
+/* as "the whole sphere minus itself". Fix each ring independently (some countries' */
+/* holes, if any, are correctly the opposite orientation of their exterior, so a    */
+/* per-ring area check — not a per-feature one — is what's actually safe here).    */
+function fixRingWinding(gj) {
+  if (!gj || !gj.features) return gj;
+  const fixRings = (rings) => rings.map((ring) =>
+    geoArea({ type: "Polygon", coordinates: [ring] }) > 2 * Math.PI ? ring.slice().reverse() : ring);
+  return {
+    ...gj,
+    features: gj.features.map((f) => {
+      const g = f.geometry;
+      if (!g) return f;
+      if (g.type === "Polygon") return { ...f, geometry: { ...g, coordinates: fixRings(g.coordinates) } };
+      if (g.type === "MultiPolygon") return { ...f, geometry: { ...g, coordinates: g.coordinates.map(fixRings) } };
+      return f;
+    }),
+  };
+}
+
+/* Picks the largest polygon ring (by bbox area) out of a Feature/FeatureCollection, */
+/* to use as the fit target for the map scale — see comment at the call site.       */
+function mainlandRing(gj) {
+  if (!gj) return null;
+  let best = null, bestArea = -1;
+  (gj.features || [gj]).forEach((f) => {
+    const g = f && f.geometry;
+    if (!g) return;
+    const polys = g.type === "Polygon" ? [g.coordinates] : g.type === "MultiPolygon" ? g.coordinates : [];
+    polys.forEach((coords) => {
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      coords[0].forEach(([x, y]) => { if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y; });
+      const area = (maxX - minX) * (maxY - minY);
+      if (area > bestArea) { bestArea = area; best = coords; }
+    });
+  });
+  return best ? { type: "Feature", properties: {}, geometry: { type: "Polygon", coordinates: best } } : null;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -368,7 +413,13 @@ function CountryMapCard({ id, events, mapView }) {
   const projection = useMemo(() => {
     if (!adm0) return null;
     try {
-      return geoMercator().fitSize([W - 16, H - 16], adm0);
+      /* ADM0 files often bundle far-flung outlying territories (Chile ships    */
+      /* with Easter Island 3700km off the mainland, Spain with the Canaries)   */
+      /* — fitting to the WHOLE geometry zooms out to fit those too, shrinking  */
+      /* the mainland (what people actually came to look at) to a sliver. Fit   */
+      /* the scale to the largest contiguous polygon instead; the full         */
+      /* geometry still gets drawn, just at the mainland's zoom level.         */
+      return geoMercator().fitSize([W - 16, H - 16], mainlandRing(adm0) || adm0);
     } catch { return null; }
   }, [adm0, W, H]);
 
@@ -415,7 +466,7 @@ function CountryMapCard({ id, events, mapView }) {
             <text x={(W - 16) / 2} y={(H - 16) / 2} textAnchor="middle" fontSize="11" fill={C.textFaint}>{t.loadingBoundary}</text>
           )}
           {mapView !== "regions" && path(adm0) && (
-            <path d={path(adm0)} fill="none" stroke={C.textFaint} strokeWidth={0.8} opacity={0.6} />
+            <path d={path(adm0)} fill="none" stroke={C.text} strokeWidth={1.5} opacity={0.55} />
           )}
           {mapView === "bubbles" && projected.map((p, i) => {
             const r = 2 + (p.mag / maxMag) * 7;
