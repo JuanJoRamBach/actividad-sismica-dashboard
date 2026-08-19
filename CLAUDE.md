@@ -63,13 +63,17 @@ npm run preview  # serve the production build locally
   is opened for that country. Do NOT pre-bundle or pre-fetch boundaries for all
   14 registry countries — that was an explicit design decision (keep initial load
   light, most users only ever activate 2-3 countries).
-  **UNVERIFIED**: the code reads `meta.simplifiedGeometryGeoJSON || meta.gjDownloadURL`
-  from the geoBoundaries API response, based on documentation, but was never
-  confirmed against a live response (sandbox couldn't reach geoboundaries.org).
-  If the Regiones tab doesn't populate after deploy, check this first — inspect
-  the actual JSON shape returned by
-  `https://www.geoboundaries.org/api/current/gbOpen/{ISO3}/ADM1/` in a real
-  browser and fix the field name if it's wrong.
+  **VERIFIED (2026-08-19)**: tested against the live API. The field name
+  (`meta.simplifiedGeometryGeoJSON || meta.gjDownloadURL`) was correct, but the
+  URL itself didn't work — both fields point at `github.com/<owner>/<repo>/raw/
+  <ref>/<path>`, which (a) 302-redirects through a response carrying an invalid
+  empty `Access-Control-Allow-Origin` header that browsers reject outright, and
+  (b) even if that resolved, the files are Git-LFS-tracked, so any raw-content
+  mirror (raw.githubusercontent.com, jsDelivr, statically.io) only serves the
+  small LFS pointer text, not the real geometry. Fixed by resolving the short
+  commit SHA via the CORS-enabled `api.github.com/repos/.../commits/{ref}`
+  endpoint and building a `media.githubusercontent.com/media/...` URL directly
+  — see `toMediaGithubUsercontent()` next to `fetchBoundary()`.
 - `CountryMapCard` — the unified map component (replaces what used to be two
   separate sections, "Densidad Sísmica" and "Epicentros Individuales" — they were
   merged because they rendered the same underlying data twice). Three tabs share
@@ -112,10 +116,10 @@ npm run preview  # serve the production build locally
       Suggested description: "Live earthquake monitoring dashboard for Chile,
       Spain, and 12+ other countries — USGS data, real geographic boundaries,
       day/night + ES/EN auto-detection." (tune as needed)
-- [ ] `LICENSE` file (MIT) was drafted but confirm it's committed — check repo
-      root before assuming it's missing.
-- [ ] Never verified the geoBoundaries API response shape live (see above) —
-      test this first after any deploy.
+- [x] `LICENSE` file (MIT) — confirmed committed and tracked in git.
+- [x] geoBoundaries live verification — done 2026-08-19, see above. The field
+      name was fine; the real bug was a CORS-broken redirect plus Git LFS, now
+      fixed in `fetchBoundary()`.
 - [ ] No screenshots in the README yet — worth adding once deployed.
 - [ ] Bundle size warning at build time (~640kB main chunk, mostly recharts +
       d3-geo) — not urgent, but code-splitting (`React.lazy` for chart-heavy

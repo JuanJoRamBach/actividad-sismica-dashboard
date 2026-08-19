@@ -137,13 +137,39 @@ async function fetchCountryData(id) {
 /* Se piden solo cuando el país está activo (ADM0) o cuando se abre la    */
 /* pestaña de regiones (ADM1) — no se precargan los 14 países.            */
 /* ---------------------------------------------------------------------- */
+/* geoBoundaries' metadata points at github.com/<owner>/<repo>/raw/<ref>/<path>.   */
+/* Two problems, discovered by testing against the live API (this was previously  */
+/* untested — sandboxed dev couldn't reach either domain):                        */
+/*  1. That URL 302-redirects, and the redirect response itself carries an empty  */
+/*     Access-Control-Allow-Origin header, which browsers treat as invalid and    */
+/*     block outright, even though the final destination's headers are fine.     */
+/*  2. The files are Git-LFS-tracked, so raw.githubusercontent.com/jsDelivr/etc.  */
+/*     only serve the small LFS pointer text, not the actual geometry — the real  */
+/*     bytes live on media.githubusercontent.com under the *full* commit SHA,     */
+/*     while geoBoundaries' metadata only gives a short SHA.                      */
+/* Fix: resolve the short SHA via the CORS-enabled api.github.com commits         */
+/* endpoint, then build the media.githubusercontent.com URL directly — skips the  */
+/* broken redirect entirely and lands on real content.                           */
+function toMediaGithubUsercontent(url) {
+  const m = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/raw\/([^/]+)\/(.+)$/.exec(url);
+  return m ? { owner: m[1], repo: m[2], ref: m[3], path: m[4] } : null;
+}
+
 async function fetchBoundary(iso3, level) {
   const metaRes = await fetch(`https://www.geoboundaries.org/api/current/gbOpen/${iso3}/${level}/`);
   if (!metaRes.ok) throw new Error("meta");
   const meta = await metaRes.json();
   const geomUrl = meta.simplifiedGeometryGeoJSON || meta.gjDownloadURL;
   if (!geomUrl) throw new Error("no-url");
-  const geomRes = await fetch(geomUrl);
+  const parsed = toMediaGithubUsercontent(geomUrl);
+  let finalUrl = geomUrl;
+  if (parsed) {
+    const shaRes = await fetch(`https://api.github.com/repos/${parsed.owner}/${parsed.repo}/commits/${parsed.ref}`);
+    if (!shaRes.ok) throw new Error("sha");
+    const { sha } = await shaRes.json();
+    finalUrl = `https://media.githubusercontent.com/media/${parsed.owner}/${parsed.repo}/${sha}/${parsed.path}`;
+  }
+  const geomRes = await fetch(finalUrl);
   if (!geomRes.ok) throw new Error("geom");
   return await geomRes.json();
 }
