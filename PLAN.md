@@ -580,22 +580,37 @@ longer leaves a stale popup behind. No console errors at any step.
    was never used by bubbles/density markers, only regions) — the
    floating popup is now a pure hover preview, and region selection for
    the docked panel is its own separate state (`selectedRegion`).
-3. User reported a 15s freeze switching to "Último año" — **could not
-   reproduce on the dev server** after this session's earlier fixes
-   (KDE clustering, recompute-on-remount, `cutoff` memoization): timed
-   every combination (Epicentros/Densidad, panel open/closed, range
-   switch) via `requestAnimationFrame` delay probes, got 300ms–1.2s
-   across the board, nowhere near 15s. **Most likely explanation: this
-   was tested against the deployed Cloudflare build, which still has
-   the pre-fix code — nothing from this session has been merged/
-   deployed yet.** Re-verify once merged and deployed before assuming
-   there's still a real bug here. Implemented the requested display cap
-   regardless since it's independently worthwhile: `EVENT_LIST_DISPLAY_
-   CAP = 100`, applied after sorting (so "top 100" is the true top 100
-   for whichever sort mode is active), with a visible "showing top 100
-   of N" note — a display-only cap on the list widget; the map itself
-   (bubbles/density) still renders every real event, nothing is hidden
-   from the actual visualization.
+3. User reported a 15s freeze switching to "Último año" — could not
+   reproduce it with the (smaller) dataset tested locally. **User then
+   confirmed, correctly, that it's real**: adding Japan (much higher
+   seismic activity) alongside an uncapped Chile caused reaction times
+   over 5s, and the density tab's per-marker "breathe" pulsar CSS
+   animation — hundreds of simultaneously-animating SVG elements —
+   "completely overwhelmed the page." **The list-only cap above (item
+   under §6 follow-ups) was the wrong fix — it never touched what
+   actually renders on the map.** Corrected: `capEventsForMap()`, top-
+   100-by-magnitude (explicit user instruction — test at 100 first,
+   drop to 50 if still too slow), applied once in `CountryMapCard` as
+   `mapEvents`, used for everything the map actually draws (bubbles,
+   density markers + pulsar animation, the Epicentros/Densidad list
+   panel). Does NOT touch `filtered[id]`/period-summary stats/charts
+   (still the true full dataset), and deliberately does NOT touch
+   `regionCounts` (capping to the top-100-strongest nationally would
+   make a region full of small aftershocks look empty, defeating the
+   point of a choropleth — documented inline in the code).
+
+   **Verified in-browser against Chile's real 548-event "Último año"
+   dataset**, not just built: bubble circle count in the DOM confirmed
+   at exactly 100 (was 548); density epicenter markers + pulsar rings
+   both confirmed at 100 for Chile (114 total across both country
+   cards = 100 capped Chile + 14 uncapped Spain); the legend's min/max
+   correctly reads M4.6–M6.9 (the capped set's real range); period-
+   summary stats still show the true 548. No console errors.
+
+   **If 100 is still too slow with a real high-activity country like
+   Japan, per the user's explicit instruction: drop `MAP_EVENT_CAP` to
+   50.** Not yet tested at that lower value — waiting on the user's
+   real-world result once this is deployed.
 
 <details>
 <summary>Original scope note (for history — now implemented as described above)</summary>
