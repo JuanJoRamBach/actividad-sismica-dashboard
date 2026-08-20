@@ -394,10 +394,35 @@ because the cache landed.
   changes in the same session (density/regions rework), or of something
   external (browser update, machine state). Worth a quick sanity check
   but not re-investigating from scratch.
+- **~~Removing a country froze ~10s, then froze again briefly right
+  after~~ / ~~froze long enough to trigger Firefox's "slowing down your
+  browser" warning~~ — FIXED, 2026-08-21.** Real root cause, found by
+  reading the actual `useMemo` deps rather than guessing: `filtered`
+  (the per-country time-range-filtered events object, in the top-level
+  `App` component) was keyed on `activeCountries` — removing any one
+  country invalidated the ENTIRE `filtered` object, rebuilding brand-new
+  event arrays (`.filter().sort()` always returns new array references)
+  for every REMAINING country too, even though their underlying data
+  hadn't changed. Those new references cascaded into every remaining
+  `CountryMapCard`'s own memoization (`projected`, `densityData`,
+  `regionCounts`), forcing the whole per-country pipeline — KDE included
+  — to recompute on a completely unrelated removal.
+
+  Fixed by iterating `Object.keys(data)` instead of `activeCountries`,
+  and dropping `activeCountries` from the deps entirely — `data` already
+  only holds countries that have been loaded and is never pruned on
+  remove, so this trades a little unused memory for a removed-but-
+  previously-loaded country for correctness, nothing else. All 8 call
+  sites already guard with `filtered[id] || []`, so extra inactive keys
+  are harmless.
+
+  **Verified, not assumed:** live dev app, Chile+Spain, "Último año",
+  Density tab open on both (so real KDE data existed for each) —
+  removing Spain took **656ms** for Chile's density surface to finish
+  re-rendering (44→22 contour paths, correctly dropping only Spain's),
+  not a multi-second freeze.
+
 - **Still needs re-checking, not confirmed fixed:**
-  - Removing a country froze ~10s, then froze again briefly right after.
-  - Removing a country froze long enough to trigger Firefox's "this page
-    is slowing down your browser" warning.
   - Dashboard gets slower the longer the session runs (possible leak or
     unbounded accumulation somewhere).
   - Hover tooltip lags behind fast mouse movement, even on a fresh load.
