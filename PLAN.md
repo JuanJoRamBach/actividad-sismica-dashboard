@@ -430,15 +430,36 @@ because the cache landed.
   ~650ms. That's the fix working as intended: it stops the *repeat* cost,
   it doesn't make the one real computation faster.
 
-  **Still open, not fixed by this:** the raw KDE algorithm's own cost for
-  large datasets (500+ events, ×2 when 2 countries are both showing
-  Density simultaneously, since `mapView` is shared across all active
-  country cards) is a genuinely separate, deeper performance problem —
-  likely the real explanation for the user's original "~1 minute" freeze
-  report, not (only) the recompute-on-remount bug. Worth its own
-  investigation (Web Worker offload? coarser grid for large N? capping
-  kernel reach more aggressively?) rather than assuming this item is
-  fully closed.
+  **~~Still open~~ — FIXED, 2026-08-21.** The raw KDE cost for large
+  datasets was real (confirmed above), and likely the actual explanation
+  for the user's original "~1 minute" freeze report, not just the
+  recompute-on-remount bug. Considered capping to the top-N events
+  (globally or per-region) but rejected it — for a seismic tool, silently
+  dropping real events to go faster is a data-integrity problem, and a
+  magnitude-based cut would specifically erase swarm/aftershock
+  clustering (the many-small-events signal a density map exists to show)
+  while leaving isolated big events untouched.
+
+  Instead: `clusterDensityPoints()` bins events into a small fixed grid
+  (independent of the main density grid) before the per-point Gaussian
+  splat — only genuinely close-in-screen-space points merge; isolated/
+  large events pass through untouched. Since the existing combine rule is
+  `max()` not sum, a cluster of near-identical overlapping small events
+  already produced a nearly identical visual result to just its
+  strongest member, so this simplifies already-redundant work rather
+  than cutting real data — every individual event is still shown in
+  bubbles/lists elsewhere.
+
+  **Verified, not assumed:** same live dataset as above (Chile+Spain,
+  "Último año", ~500+ events) — cold first switch dropped from 30+
+  seconds to **~989ms**, with an **identical 44 contour paths** rendered
+  before and after. Same visual output, ~27x faster.
+
+  Remaining, smaller levers (Web Worker offload, coarser grid, capping
+  kernel reach) are no longer needed for this dataset but stay
+  available if a future pathological case (very large, evenly-spread,
+  non-clustered event set) needs them — clustering helps least exactly
+  when data isn't clustered.
 
 Likely candidates for the other still-open freeze items (country removal,
 tooltip lag, scrolling jank): `geoContains` region-containment checks
