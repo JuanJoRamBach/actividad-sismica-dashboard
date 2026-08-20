@@ -500,12 +500,19 @@ function AlertTooltip({ active, payload }) {
 /* with densityRamp() (the Density surface's own violet/magenta palette, see   */
 /* the token comment near its definition) so band-to-band steps are real       */
 /* computed intensity, not visual noise from overlapping shapes.               */
-function DensitySurface({ pts, w, h }) {
-  const C = React.useContext(ThemeContext);
-  const cellPx = 3;
-  const { contours, padCells } = useMemo(() => {
-    if (pts.length < 1) return { contours: [], padCells: 0 };
-    const maxR = Math.max(20, ...pts.map((p) => p.r || 20));
+/* Pulled out of DensitySurface so CountryMapCard can memoize it at ITS OWN      */
+/* level (see densityData there) instead of DensitySurface's own useMemo, which */
+/* only lives as long as DensitySurface stays mounted — since it's only mounted */
+/* while mapView === "density", switching tabs away and back was unmounting and */
+/* remounting it, throwing away the memo and recomputing this whole KDE grid    */
+/* from scratch every single time, even with unchanged events. That's the real  */
+/* cause of the "Density tab freezes on switch" symptom — regionCounts doesn't  */
+/* have this problem because it already lives in CountryMapCard directly.       */
+const DENSITY_CELL_PX = 3;
+function computeDensityContours(pts, w, h) {
+  const cellPx = DENSITY_CELL_PX;
+  if (pts.length < 1) return { contours: [], padCells: 0 };
+  const maxR = Math.max(20, ...pts.map((p) => p.r || 20));
     /* Same reasoning as before: pad past any single point's own kernel reach so */
     /* it fades near-zero before the true edge, instead of getting hard-cut.     */
     const padCells = Math.ceil((maxR * 2.5) / cellPx);
@@ -590,8 +597,15 @@ function DensitySurface({ pts, w, h }) {
     const thresholds = Array.from({ length: levels }, (_, i) => maxVal * (0.5 - 0.5 * Math.cos(Math.PI * (i + 1) / levels)));
     const cs = d3contours().size([gridW, gridH]).thresholds(thresholds)(grid);
     return { contours: cs, padCells };
-  }, [pts, w, h]);
+}
 
+/* Pure rendering — no computation here. contours/padCells now come in as props, */
+/* computed once by CountryMapCard's own densityData useMemo (see there) so this */
+/* component's own mount/unmount lifecycle (tied to mapView === "density") can't */
+/* throw the expensive part away. See computeDensityContours() above for why.    */
+function DensitySurface({ contours, padCells, w, h }) {
+  const C = React.useContext(ThemeContext);
+  const cellPx = DENSITY_CELL_PX;
   if (!contours.length) return null;
   const contourPath = geoPath();
   const uid = `${Math.round(w)}-${Math.round(h)}`;
@@ -841,6 +855,26 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
 
   const maxMag = Math.max(1, ...events.map((e) => e.mag));
 
+  /* Same "compute once, keep across tab switches" fix as regionCounts below —   */
+  /* densityVisited mirrors what adm1 does for Regions: adm1 only gets populated */
+  /* once the Regions tab's fetch effect actually runs, so regionCounts' useMemo */
+  /* naturally skips the expensive work until then, and is never thrown away by  */
+  /* a tab switch since it lives here, not inside a conditionally-mounted child. */
+  /* Density has no fetch to gate on (it's pure client-side computation from     */
+  /* events already in hand), so a plain "have we ever shown this tab" flag      */
+  /* does the same job.                                                         */
+  const [densityVisited, setDensityVisited] = useState(mapView === "density");
+  useEffect(() => { if (mapView === "density") setDensityVisited(true); }, [mapView]);
+
+  const densityPts = useMemo(() =>
+    projected.map((p) => ({ x: p.x, y: p.y, r: p.radiusPx, w: p.mag / maxMag })),
+    [projected, maxMag]);
+
+  const densityData = useMemo(() => {
+    if (!densityVisited) return { contours: [], padCells: 0 };
+    return computeDensityContours(densityPts, W - 16, H - 16);
+  }, [densityVisited, densityPts, W, H]);
+
   const regionCounts = useMemo(() => {
     if (!adm1 || !path) return null;
     return adm1.features.map((f) => {
@@ -899,7 +933,7 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
             })}
             {mapView === "density" && (
               <>
-                <DensitySurface pts={projected.map((p) => ({ x: p.x, y: p.y, r: p.radiusPx, w: p.mag / maxMag }))} w={W - 16} h={H - 16} />
+                <DensitySurface contours={densityData.contours} padCells={densityData.padCells} w={W - 16} h={H - 16} />
                 {/* A weak/isolated event on a large, elongated map (Chile: same physical  */}
                 {/* felt-radius in km projects to fewer pixels than on a compact country's  */}
                 {/* map, since the projection's pixels-per-km ratio is smaller) can render  */}

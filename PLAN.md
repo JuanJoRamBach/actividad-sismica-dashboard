@@ -402,20 +402,48 @@ because the cache landed.
     unbounded accumulation somewhere).
   - Hover tooltip lags behind fast mouse movement, even on a fresh load.
   - Scrolling feels janky/stepped rather than smooth.
-- **New question raised 2026-08-21, not yet answered:** does the map
-  fully re-render/recompute (projection, `path(adm0)`, KDE grid, etc.) on
-  every `mapView` tab switch, even for parts that don't depend on which
-  tab is active (the ADM0 outline and projection shouldn't change between
-  Epicentros/Densidad/Regiones — only what's drawn on top of them
-  should)? If `useMemo` deps are wider than they need to be, tab-switching
-  could be doing far more work than necessary. Check this before assuming
-  the remaining freeze items are only about `DensityField`/`geoContains`
-  cost — it might explain some of item 5's *other* symptoms too, not just
-  the (apparently now-fixed) tab-switch one.
+- **~~New question raised 2026-08-21~~ — ANSWERED, and partially fixed,
+  2026-08-21.** Checked `useMemo` deps directly rather than guessing:
+  `projection`/`path` (deps `[adm0, W, H]`) and `regionCounts` (deps
+  `[adm1, path, events]`) were already correctly independent of
+  `mapView` — no bug there, tab switching was never recomputing the
+  country outline or region choropleth. **But `DensitySurface`'s KDE grid
+  computation had its own internal `useMemo`, inside a component that
+  only exists while `mapView === "density"`** — every tab switch away
+  unmounted it, and every switch back remounted a fresh instance with no
+  memory of the previous computation, rerunning the whole KDE grid from
+  scratch even with unchanged events. This is almost certainly the actual
+  cause of the original "Density tab freezes on switch" report. Fixed by
+  pulling the computation out into a standalone `computeDensityContours()`
+  function and memoizing it in `CountryMapCard` itself (a `densityData`
+  useMemo, gated by a `densityVisited` flag so it's still not computed
+  until Density is actually opened once) — same pattern `regionCounts`
+  already used successfully. `DensitySurface` is now pure rendering, no
+  computation of its own.
 
-Likely candidates for the still-open items: the `DensityField`/KDE
-per-point computation, and `geoContains` region-containment checks
-(O(events × regions)) re-running on every country add/remove.
+  **Verified, not just assumed:** instrumented the live dev app (Chile +
+  Spain, "Último año" range, ~500+ events) — cold first switch into
+  Density took long enough to exceed a 30s script timeout (confirms the
+  *first* computation is genuinely expensive for a large dataset — a
+  real, separate problem this fix does NOT address, see below), but a
+  second switch away and back rendered the identical 44 contour paths in
+  ~650ms. That's the fix working as intended: it stops the *repeat* cost,
+  it doesn't make the one real computation faster.
+
+  **Still open, not fixed by this:** the raw KDE algorithm's own cost for
+  large datasets (500+ events, ×2 when 2 countries are both showing
+  Density simultaneously, since `mapView` is shared across all active
+  country cards) is a genuinely separate, deeper performance problem —
+  likely the real explanation for the user's original "~1 minute" freeze
+  report, not (only) the recompute-on-remount bug. Worth its own
+  investigation (Web Worker offload? coarser grid for large N? capping
+  kernel reach more aggressively?) rather than assuming this item is
+  fully closed.
+
+Likely candidates for the other still-open freeze items (country removal,
+tooltip lag, scrolling jank): `geoContains` region-containment checks
+(O(events × regions)) re-running on every country add/remove — not yet
+investigated.
 
 ## 6. Consistent event-list window across all 3 map tabs — NOT STARTED, scope decided 2026-08-21
 
