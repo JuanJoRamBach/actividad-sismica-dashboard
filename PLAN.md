@@ -462,7 +462,27 @@ tackle it in disciplined pieces with individual commits per sub-piece
 top of this file) rather than one large uncommitted pass — easier to
 isolate and revert if a specific piece goes wrong.
 
-## 7. GitHub API boundary-fetch caching — NOT STARTED, priority raised 2026-08-21
+## 7. GitHub API boundary-fetch caching — DONE
+
+Implemented in [src/App.jsx](src/App.jsx) `fetchBoundary()`: resolved
+boundary GeoJSON (post `fixRingWinding`/`fixShapeNames`) is cached in
+localStorage keyed by `boundary-cache-v{BOUNDARY_CACHE_VERSION}-{iso3}-
+{level}`, no TTL. Verified via automated network-request check (not just
+eyeballing): second page load makes zero requests to `geoboundaries.org`
+or any `github.com`/`githubusercontent.com` host, and the map still
+renders correctly from the cached data. `BOUNDARY_CACHE_VERSION` is the
+manual-bust escape hatch — bump it if the fetch/fix pipeline itself ever
+changes and old cached entries need invalidating.
+
+Also resolves the practical cause of item 4 (boundary loading flakiness)
+by construction — repeated add/remove of countries no longer spends
+network requests after the first fetch per country/level, so there's
+much less opportunity to trip GitHub's rate limit at all.
+
+<details>
+<summary>Original scoping note (superseded by the above, kept for context)</summary>
+
+NOT STARTED, priority raised 2026-08-21
 
 Previously logged as a low-priority "nice to have" (see HANDOFF.md). Re-
 scoped upward after clarifying the actual mechanics of GitHub's rate
@@ -500,6 +520,8 @@ limit, discussed 2026-08-21:
 - Related to and likely explains item 4 (boundary loading flakiness) —
   see that section for the connection.
 
+</details>
+
 ---
 
 ## Suggested order of attack
@@ -512,10 +534,9 @@ convention unless told otherwise:
 2. ~~Regions tab legend + click/hover affordance~~ — DONE
 3. ~~Density tab color + rendering approach~~ — DONE
 4. ~~Map fitting~~ — DONE (see corrected §0)
-5. Regions tab (ADM1) boundary lines too thin, esp. Atlas/day theme (§2b)
-   — small, contained, same pattern as the earlier ADM0 outline fix
-6. GitHub API boundary caching (§7) — medium, contained, real user-impact
-   fix, likely also resolves item 4 (boundary loading flakiness)
+5. ~~Regions tab (ADM1) boundary lines too thin, esp. Atlas/day theme~~
+   (§2b) — DONE
+6. ~~GitHub API boundary caching~~ (§7) — DONE
 7. Performance re-verification (§5) — re-check remaining freeze symptoms
    now that tab-switching is confirmed fixed; check the tab-switch
    recompute question while here
