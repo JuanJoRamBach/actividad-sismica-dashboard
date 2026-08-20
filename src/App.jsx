@@ -14,6 +14,18 @@ import { STRINGS, detectLang } from "./i18n.js";
 
 function usgsEventUrl(eventId) { return `https://earthquake.usgs.gov/earthquakes/eventpage/${eventId}`; }
 
+/* Shared across all 3 map tabs' event lists (Epicentros/Densidad/Regiones) — the */
+/* user explicitly rejected a single fixed default order (most recent / strongest */
+/* magnitude / nearest-to-viewport-center were all considered and turned down) in */
+/* favor of a toggle they control themselves. One function, one set of toggle     */
+/* buttons, reused identically in all three rather than three separate orderings. */
+function sortEvents(events, mode) {
+  const arr = events.slice();
+  if (mode === "magnitude") arr.sort((a, b) => b.mag - a.mag);
+  else arr.sort((a, b) => b.time - a.time);
+  return arr;
+}
+
 const EARTH_RADIUS_KM = 6371;
 /* Great-circle destination point, given a start point, distance, and bearing  */
 /* (standard spherical formula) — used to measure "how many pixels is N km,    */
@@ -746,6 +758,75 @@ function regionColor(C, v, max) {
 }
 
 
+/* Shared docked list panel — same component, same position/sizing/styling, used  */
+/* by all 3 map tabs so switching between them doesn't change the card's height   */
+/* or jump the layout around. title/count/events vary per tab (Regiones passes    */
+/* the currently-selected region's own list; Epicentros/Densidad pass every event */
+/* currently on the map); the sort toggle and collapse behavior are identical     */
+/* everywhere, not three separate implementations of the same idea.               */
+function EventListPanel({ id, C, t, title, count, events, collapsed, onToggleCollapse, sortMode, onSortChange, emptyText, hint, onEventClick, forceCollapsed, placeholderHint }) {
+  const isCollapsed = collapsed;
+  const sorted = useMemo(() => sortEvents(events, sortMode), [events, sortMode]);
+  return (
+    <div style={{
+      position: "absolute", left: 8, bottom: 8, width: 200,
+      display: "flex", flexDirection: "column", background: C.surface, border: `1px solid ${C.surfaceBorder}`,
+      borderRadius: 10, boxShadow: `0 8px 24px ${C.surfaceShadow}`, zIndex: 4, overflow: "hidden",
+    }}>
+      <button onClick={onToggleCollapse} disabled={!onToggleCollapse}
+        aria-label={isCollapsed ? t.epicenterListExpand : t.epicenterListCollapse}
+        style={{
+          display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%",
+          padding: "8px 10px", background: "none", border: "none", cursor: onToggleCollapse ? "pointer" : "default", textAlign: "left",
+        }}>
+        <span style={{ fontSize: 10, fontWeight: 600, letterSpacing: 0.4, textTransform: "uppercase", color: C.textDim }}>
+          {title}{count !== null && count !== undefined ? ` · ${count}` : ""}
+        </span>
+        {onToggleCollapse && <span style={{ color: C.textFaint, fontSize: 16, lineHeight: 1 }}>{isCollapsed ? "▸" : "▾"}</span>}
+      </button>
+      {/* forceCollapsed (e.g. Regiones with no region picked yet) always shows its   */}
+      {/* placeholder hint even though there's no list/toggle — a real "nothing to    */}
+      {/* show yet" state, distinct from the user manually collapsing a real list.    */}
+      {forceCollapsed && placeholderHint && (
+        <div style={{ fontSize: 10.5, color: C.textFaint, padding: "0 10px 12px" }}>{placeholderHint}</div>
+      )}
+      {!forceCollapsed && !isCollapsed && (
+        sorted.length > 0 ? (
+          <>
+            <div style={{ display: "flex", gap: 4, padding: "0 10px 5px" }}>
+              {[["time", t.sortByTime], ["magnitude", t.sortByMagnitude]].map(([mode, label]) => (
+                <button key={mode} onClick={() => onSortChange(mode)}
+                  style={{
+                    fontSize: 9, padding: "2px 7px", borderRadius: 999, cursor: "pointer",
+                    border: `1px solid ${sortMode === mode ? C.text : C.surfaceBorder}`,
+                    background: sortMode === mode ? withAlpha(C.text, 0.1) : "none",
+                    color: sortMode === mode ? C.text : C.textFaint,
+                  }}>{label}</button>
+              ))}
+            </div>
+            {hint && <div style={{ fontSize: 9, color: C.textFaint, padding: "0 10px 5px" }}>{hint}</div>}
+            <div style={{ height: 130, overflowY: "auto", padding: "0 6px 8px", display: "flex", flexDirection: "column", gap: 1 }}>
+              {sorted.map((p, i) => (
+                <button key={p.id || i} onClick={() => onEventClick(p)}
+                  style={{ display: "block", textAlign: "left", background: "none", border: "none", cursor: "pointer", borderRadius: 6, padding: "5px 4px", width: "100%" }}
+                  onMouseEnter={(ev) => { ev.currentTarget.style.background = withAlpha(C.text, 0.06); }}
+                  onMouseLeave={(ev) => { ev.currentTarget.style.background = "transparent"; }}>
+                  <div style={{ fontSize: 10.5, color: C.text, lineHeight: 1.3 }}>{p.place}</div>
+                  <div style={{ fontSize: 9.5, color: C.textDim }}>
+                    M <b style={{ color: C.dotRed }}>{p.mag}</b>{p.time ? ` · ${fmtLocalTime(p.time, id, "es")}` : ""}
+                  </div>
+                </button>
+              ))}
+            </div>
+          </>
+        ) : (
+          <div style={{ fontSize: 10.5, color: C.textFaint, padding: "0 10px 12px" }}>{emptyText}</div>
+        )
+      )}
+    </div>
+  );
+}
+
 /* ---------------------------------------------------------------------- */
 /* Sección de mapa unificada — Epicentros / Densidad / Regiones           */
 /* Usa geoBoundaries en vivo (ADM0 para el contorno, ADM1 para regiones)  */
@@ -760,7 +841,12 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
   const [adm1, setAdm1] = useState(null);
   const [adm1Status, setAdm1Status] = useState("idle");
   const [popup, setPopup] = useState(null);
+  /* A pinned region/event popup used to linger visually after switching tabs      */
+  /* (mapView didn't clear it) — a stale "Región X selected" popup floating over   */
+  /* the Density surface makes no sense once you've left the Regions tab.         */
+  useEffect(() => { setPopup(null); }, [mapView]);
   const [listCollapsed, setListCollapsed] = useState(false);
+  const [sortMode, setSortMode] = useState("time");
   const svgRef = useRef(null);
   const zoomBehaviorRef = useRef(null);
   const [transform, setTransform] = useState(zoomIdentity);
@@ -913,6 +999,10 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
     });
   }, [adm1, events, path]);
   const maxRegionCount = regionCounts ? Math.max(1, ...regionCounts.map((r) => r.count)) : 1;
+  /* Pinned (clicked), not just hovered — a hover-only preview shouldn't drive the  */
+  /* docked list panel below, or moving the mouse across the map would constantly  */
+  /* flicker its contents. Only a deliberate click "selects" a region.             */
+  const selectedRegion = popup && popup.kind === "region" && popup.pinned ? popup.region : null;
 
   if (adm0Status === "loading") {
     return <div style={{ height: H * 0.5, display: "flex", alignItems: "center", justifyContent: "center", color: C.textFaint, fontSize: 12.5 }}>{t.loadingBoundary}</div>;
@@ -941,7 +1031,7 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
                   style={{ cursor: "pointer" }}
                   onMouseEnter={() => { if (!(popup && popup.pinned)) setPopup({ kind: "region", region: { name, count: r.count, events: r.events }, x: r.cx, y: r.cy, pinned: false }); }}
                   onMouseLeave={() => setPopup((pp) => (pp && pp.pinned ? pp : null))}
-                  onClick={(ev) => { ev.stopPropagation(); setPopup({ kind: "region", region: { name, count: r.count, events: r.events }, x: r.cx, y: r.cy, pinned: true }); }} />
+                  onClick={(ev) => { ev.stopPropagation(); setPopup({ kind: "region", region: { name, count: r.count, events: r.events }, x: r.cx, y: r.cy, pinned: true }); setListCollapsed(false); }} />
               );
             })}
             {mapView === "regions" && adm1Status === "loading" && (
@@ -993,14 +1083,21 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
                     <stop offset="100%" stopColor={C.epicenterEdge} stopOpacity="0" />
                   </radialGradient>
                 </defs>
+                {/* Same hover-preview / click-to-open popup as the Epicentros bubbles — this  */}
+                {/* previously had no interaction at all. Only on the primary dot, not the     */}
+                {/* pulse ring (pointerEvents: none there) so hover doesn't double-fire.        */}
                 {projected.map((p, i) => (
                   <circle key={`ep-${i}`} cx={p.x} cy={p.y} r={Math.min(3.2, Math.max(1.5, (p.radiusPx || 20) * 0.055))}
-                    fill={`url(#epicenter-${id})`} stroke={C.text} strokeWidth={0.5 / k} strokeOpacity={0.5} />
+                    fill={`url(#epicenter-${id})`} stroke={C.text} strokeWidth={0.5 / k} strokeOpacity={0.5}
+                    style={{ cursor: "pointer" }}
+                    onMouseEnter={() => setPopup((pp) => (pp && pp.pinned ? pp : { kind: "event", event: p, x: p.x, y: p.y, pinned: false }))}
+                    onMouseLeave={() => setPopup((pp) => (pp && pp.pinned ? pp : null))}
+                    onClick={(ev) => { ev.stopPropagation(); if (p.id) window.open(usgsEventUrl(p.id), "_blank", "noopener,noreferrer"); }} />
                 ))}
                 {projected.map((p, i) => (
                   <circle key={`pulse-${i}`} className="liveDot" cx={p.x} cy={p.y} r={3.5 / k}
                     fill="none" stroke={C.epicenterCore} strokeWidth={0.9 / k} strokeOpacity={0.6}
-                    style={{ transformBox: "fill-box", transformOrigin: "center" }} />
+                    style={{ transformBox: "fill-box", transformOrigin: "center", pointerEvents: "none" }} />
                 ))}
               </>
             )}
@@ -1024,23 +1121,13 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
         }}>
           {popup.pinned && <button onClick={() => setPopup(null)} aria-label="Close" style={{ position: "absolute", top: 4, right: 6, background: "none", border: "none", color: C.textFaint, fontSize: 14, cursor: "pointer", lineHeight: 1 }}>×</button>}
           {popup.kind === "region" ? (
-            <>
-              <div style={{ fontSize: 12.5, color: C.text, fontWeight: 600, paddingRight: 14 }}>{popup.region.name}</div>
-              <div style={{ fontSize: 11.5, color: C.textDim, marginTop: 2, marginBottom: popup.pinned && popup.region.events.length ? 6 : 0 }}>{t.regionEventsCount(popup.region.count)}</div>
-              {popup.pinned && popup.region.events.length > 0 && (
-                <div style={{ maxHeight: 170, overflowY: "auto", display: "flex", flexDirection: "column", gap: 7, borderTop: `1px solid ${C.surfaceBorder}`, paddingTop: 6 }}>
-                  {popup.region.events.map((e) => (
-                    <a key={e.id} href={usgsEventUrl(e.id)} target="_blank" rel="noopener noreferrer"
-                      style={{ display: "block", textDecoration: "none", color: "inherit" }}>
-                      <div style={{ fontSize: 11, color: C.text }}>{e.place}</div>
-                      <div style={{ fontSize: 10.5, color: C.textDim }}>
-                        M <b style={{ color: C.dotRed }}>{e.mag}</b> · {e.depth} km{e.time ? ` · ${fmtLocalTime(e.time, id, "es")}` : ""}
-                      </div>
-                    </a>
-                  ))}
-                </div>
-              )}
-            </>
+            /* Just name + count here — the full event list lives in the docked   */
+            /* EventListPanel below now (see "the region popup BECOMES this tab's */
+            /* version of the panel" in PLAN.md §6), not duplicated in both.      */
+            <div style={{ fontSize: 12.5, color: C.text, fontWeight: 600, paddingRight: 14 }}>
+              {popup.region.name}
+              <div style={{ fontSize: 11.5, color: C.textDim, fontWeight: 400, marginTop: 2 }}>{t.regionEventsCount(popup.region.count)}</div>
+            </div>
           ) : (
             <>
               <div style={{ fontSize: 12.5, color: C.text, fontWeight: 600, paddingRight: 14 }}>{popup.event.place}</div>
@@ -1059,48 +1146,39 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
           )}
         </div>
       )}
-      {mapView === "density" && (
-        <div style={{
-          position: "absolute", left: 8, bottom: 8, width: 200,
-          display: "flex", flexDirection: "column", background: C.surface, border: `1px solid ${C.surfaceBorder}`,
-          borderRadius: 10, boxShadow: `0 8px 24px ${C.surfaceShadow}`, zIndex: 4, overflow: "hidden",
-        }}>
-          <button onClick={() => setListCollapsed((v) => !v)}
-            aria-label={listCollapsed ? t.epicenterListExpand : t.epicenterListCollapse}
-            style={{
-              display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%",
-              padding: "8px 10px", background: "none", border: "none", cursor: "pointer", textAlign: "left",
-            }}>
-            <span style={{ fontSize: 10, fontWeight: 600, letterSpacing: 0.4, textTransform: "uppercase", color: C.textDim }}>
-              {t.epicenterListTitle} · {projected.length}
-            </span>
-            <span style={{ color: C.textFaint, fontSize: 16, lineHeight: 1 }}>{listCollapsed ? "▸" : "▾"}</span>
-          </button>
-          {!listCollapsed && (
-            projected.length > 0 ? (
-              <>
-                <div style={{ fontSize: 9, color: C.textFaint, padding: "0 10px 5px" }}>{t.epicenterListHint}</div>
-                <div style={{ height: 130, overflowY: "auto", padding: "0 6px 8px", display: "flex", flexDirection: "column", gap: 1 }}>
-                  {projected.map((p, i) => (
-                    <button key={p.id || i} onClick={() => zoomToEvent(p)}
-                      style={{ display: "block", textAlign: "left", background: "none", border: "none", cursor: "pointer", borderRadius: 6, padding: "5px 4px", width: "100%" }}
-                      onMouseEnter={(ev) => { ev.currentTarget.style.background = withAlpha(C.text, 0.06); }}
-                      onMouseLeave={(ev) => { ev.currentTarget.style.background = "transparent"; }}>
-                      <div style={{ fontSize: 10.5, color: C.text, lineHeight: 1.3 }}>{p.place}</div>
-                      <div style={{ fontSize: 9.5, color: C.textDim }}>
-                        M <b style={{ color: C.dotRed }}>{p.mag}</b>{p.time ? ` · ${fmtLocalTime(p.time, id, "es")}` : ""}
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              </>
-            ) : (
-              <div style={{ fontSize: 10.5, color: C.textFaint, padding: "0 10px 12px" }}>{t.epicenterListEmpty}</div>
-            )
-          )}
-        </div>
+      {(mapView === "density" || mapView === "bubbles") && (
+        <EventListPanel id={id} C={C} t={t}
+          title={t.epicenterListTitle} count={projected.length} events={projected}
+          collapsed={listCollapsed} onToggleCollapse={() => setListCollapsed((v) => !v)}
+          sortMode={sortMode} onSortChange={setSortMode}
+          emptyText={t.epicenterListEmpty} hint={t.epicenterListHint} onEventClick={zoomToEvent} />
+      )}
+      {mapView === "regions" && (
+        <EventListPanel id={id} C={C} t={t}
+          title={selectedRegion ? selectedRegion.name : t.regionListTitlePlaceholder}
+          count={selectedRegion ? selectedRegion.count : null} events={selectedRegion ? selectedRegion.events : []}
+          collapsed={listCollapsed} onToggleCollapse={selectedRegion ? () => setListCollapsed((v) => !v) : undefined}
+          forceCollapsed={!selectedRegion} placeholderHint={t.regionListPlaceholderHint}
+          sortMode={sortMode} onSortChange={setSortMode}
+          emptyText={t.epicenterListEmpty} hint={t.epicenterListHint}
+          onEventClick={zoomToEvent} />
       )}
       </div>
+      {mapView === "bubbles" && (
+        /* Bubbles are sized by magnitude, not colored on a gradient, so a literal   */
+        /* gradient-bar legend (like Regiones/Densidad below) wouldn't mean anything */
+        /* here — two actual differently-sized dots showing the real min/max         */
+        /* magnitude on this map is the honest equivalent, not a filler row just to  */
+        /* match height. Row height still matches the other two legends so switching */
+        /* tabs doesn't change the card's total height.                             */
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8, fontSize: 11, color: C.textDim }}>
+          <span>{t.bubblesLegendLabel}</span>
+          <span style={{ width: 4, height: 4, borderRadius: "50%", background: C.dotRed, flexShrink: 0 }} />
+          <span>M{events.length ? Math.min(...events.map((e) => e.mag)).toFixed(1) : "–"}</span>
+          <span style={{ width: 9, height: 9, borderRadius: "50%", background: C.dotRed, flexShrink: 0 }} />
+          <span>M{events.length ? maxMag.toFixed(1) : "–"}</span>
+        </div>
+      )}
       {mapView === "regions" && regionCounts && (
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8, fontSize: 11, color: C.textDim }}>
           <span>{t.regionLegendLabel}</span>
