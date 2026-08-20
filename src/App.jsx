@@ -825,13 +825,18 @@ function EventListPanel({ id, C, t, title, count, totalCount, events, collapsed,
         sorted.length > 0 ? (
           <>
             <div style={{ display: "flex", gap: 4, padding: "0 10px 5px" }}>
+              {/* Solid C.bloodRed, not the selected-tab bloodRed->rose gradient — same red    */
+              /* family, but at this size (9px text) the gradient's lighter "rose" end        */
+              /* only just clears WCAG AAA in crimson (7.08:1) and misses it in atlas          */
+              /* (5.81:1). Solid bloodRed + white text computes to 8.9-10:1 in both themes,    */
+              /* verified, not eyeballed — comfortably AAA regardless of theme.               */}
               {[["time", t.sortByTime], ["magnitude", t.sortByMagnitude]].map(([mode, label]) => (
                 <button key={mode} onClick={() => onSortChange(mode)}
                   style={{
                     fontSize: 9, padding: "2px 7px", borderRadius: 999, cursor: "pointer",
-                    border: `1px solid ${sortMode === mode ? C.text : C.surfaceBorder}`,
-                    background: sortMode === mode ? withAlpha(C.text, 0.1) : "none",
-                    color: sortMode === mode ? C.text : C.textFaint,
+                    border: `1px solid ${sortMode === mode ? C.bloodRed : C.surfaceBorder}`,
+                    background: sortMode === mode ? C.bloodRed : "none",
+                    color: sortMode === mode ? "#fff" : C.textFaint,
                   }}>{label}</button>
               ))}
             </div>
