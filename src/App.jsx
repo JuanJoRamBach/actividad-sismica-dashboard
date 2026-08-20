@@ -841,7 +841,7 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
               const isHovered = popup && popup.kind === "region" && popup.region.name === name;
               return (
                 <path key={i} d={r.d} fill={regionColor(C, r.count, maxRegionCount)}
-                  stroke={isHovered ? C.text : withAlpha(C.text, 0.15)} strokeWidth={(isHovered ? 1.4 : 0.5) / k}
+                  stroke={isHovered ? C.text : withAlpha(C.text, 0.5)} strokeWidth={(isHovered ? 1.6 : 0.9) / k}
                   style={{ cursor: "pointer" }}
                   onMouseEnter={() => { if (!(popup && popup.pinned)) setPopup({ kind: "region", region: { name, count: r.count, events: r.events }, x: r.cx, y: r.cy, pinned: false }); }}
                   onMouseLeave={() => setPopup((pp) => (pp && pp.pinned ? pp : null))}

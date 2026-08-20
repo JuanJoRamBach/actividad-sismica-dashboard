@@ -153,22 +153,20 @@ per-region event list, not just the count, threaded from `regionCounts` in
 
 </details>
 
-## 2b. Regions tab (ADM1) boundary lines too thin, especially in Atlas (day theme)
+## 2b. Regions tab (ADM1) boundary lines too thin, especially in Atlas (day theme) — DONE
 
-**Reported 2026-08-21, not yet fixed.** Same category of bug as the ADM0
-country-outline fix from earlier in this project (see git log — the
-outline was originally `stroke={C.textFaint}` at `strokeWidth={0.8}`,
-`opacity={0.6}`, bumped to `stroke={C.text}` at `strokeWidth={1.5}`,
-`opacity={0.55}` because it was nearly invisible at normal card size). The
-*region* (ADM1) boundary stroke inside the Regions tab is a **separate**
-line in the code and apparently never got the same treatment — in Chile
-the user can't distinguish region borders from each other at all, and in
-Spain they're barely differentiable. Reads worse in Atlas (day theme)
-specifically, consistent with a light theme having less inherent contrast
-margin than the near-black crimson background for a given stroke color/
-opacity. Find the ADM1 `<path>` stroke in `CountryMapCard`'s `regions`
-render branch and apply the same kind of contrast/width bump, verified in
-both themes, not just crimson.
+Same category of bug as the ADM0 country-outline fix from earlier in this
+project. Found the actual cause: the default (non-hovered) region border
+in `CountryMapCard`'s `regions` render branch was `stroke={withAlpha(C.text,
+0.15)}` at `strokeWidth={0.5 / k}` — 15% opacity, sub-pixel-thin, and
+easy to miss even in isolation, made worse by adjacent regions with
+similar event counts landing close together on the `regionLow→regionHigh`
+fill ramp (similar fill color either side of an already-faint border).
+Fixed in [src/App.jsx:844](src/App.jsx:844): bumped to `withAlpha(C.text,
+0.5)` at `0.9 / k`, keeping the hovered state a clear step up
+(`C.text` full opacity, `1.6 / k`) so hover still reads distinctly.
+User-verified in-browser 2026-08-21: "Lines are perfect, I can clearly see
+the regions in Chile."
 
 ## 3. Density tab — visual design and color — DONE
 
@@ -512,8 +510,8 @@ convention unless told otherwise:
 2. ~~Regions tab legend + click/hover affordance~~ — DONE
 3. ~~Density tab color + rendering approach~~ — DONE
 4. ~~Map fitting~~ — DONE (see corrected §0)
-5. Regions tab (ADM1) boundary lines too thin, esp. Atlas/day theme (§2b)
-   — small, contained, same pattern as the earlier ADM0 outline fix
+5. ~~Regions tab (ADM1) boundary lines too thin, esp. Atlas/day theme~~
+   (§2b) — DONE
 6. GitHub API boundary caching (§7) — medium, contained, real user-impact
    fix, likely also resolves item 4 (boundary loading flakiness)
 7. Performance re-verification (§5) — re-check remaining freeze symptoms
