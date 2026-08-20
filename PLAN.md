@@ -531,7 +531,45 @@ tooltip lag, scrolling jank): `geoContains` region-containment checks
 (O(events × regions)) re-running on every country add/remove — not yet
 investigated.
 
-## 6. Consistent event-list window across all 3 map tabs — NOT STARTED, scope decided 2026-08-21
+## 6. Consistent event-list window across all 3 map tabs — DONE, 2026-08-21
+
+New shared `EventListPanel` component in [src/App.jsx](src/App.jsx), used
+identically by all 3 tabs (Density's existing bespoke implementation was
+refactored to use it too, not duplicated):
+
+- **Epicentros**: gets the docked list panel + a legend row (two real
+  differently-sized dots labeled with actual min/max magnitude on the
+  map, not a fake gradient bar — bubbles are sized by magnitude, not
+  colored on a scale, so a literal Regiones/Densidad-style gradient
+  legend would've been meaningless filler).
+- **Regiones**: the region popup is this tab's version of the panel.
+  Defaults collapsed with placeholder copy when nothing's selected;
+  selection is driven by a *pinned* (clicked) region, not hover, so
+  mousing across regions doesn't flicker the panel open/closed. The
+  floating region popup itself was trimmed to name+count only — it used
+  to inline the full list too, which would now show in both places.
+- **Density**: epicenter markers (previously zero interaction) now get
+  the same hover-preview/click-to-open-USGS popup Epicentros' bubbles
+  already have.
+- **Ordering**: `sortEvents()` + one `sortMode` state per country card,
+  shared identically across all 3 panels via two toggle buttons
+  ("Recientes"/"Magnitud") — the user-toggleable design decided above,
+  not a fixed default.
+- **Bonus fix found while testing**: a pinned popup used to linger after
+  switching map tabs (`mapView` wasn't clearing it) — fixed with a
+  `useEffect(() => setPopup(null), [mapView])`.
+
+**Verified in-browser**, not just built: Epicentros panel+legend render
+correctly for both countries; Regiones defaults to the placeholder and
+opens with a real event list on click (tested both a 0-event region and
+a real 4-event one, Andalucía); the Magnitud sort toggle actually
+re-sorts (confirmed descending M5.2→M4.6) and the chosen mode carries
+across tab switches within a session; Density markers show the hover
+popup with place/magnitude/depth/time and a USGS link; switching tabs no
+longer leaves a stale popup behind. No console errors at any step.
+
+<details>
+<summary>Original scope note (for history — now implemented as described above)</summary>
 
 Currently only the Density tab has a collapsible event-list panel; the
 other two tabs have nothing (Epicentros) or a legend but no list
@@ -554,14 +592,13 @@ reason:
   the **same hover popup Epicentros' bubbles already have** (place, mag,
   depth, time) — this is new interactive surface for Density, not a
   redesign of the existing list panel.
-- **Ordering must be decided once and applied consistently across all 3
-  tabs' lists** — currently unspecified/accidental (probably just
-  USGS API response order for the existing Density list, never chosen on
-  purpose). Options discussed: most recent first, strongest magnitude
-  first, or nearest-to-viewport-center first. **Needs an explicit decision
-  before implementation** — whatever's chosen affects list-header/hint
-  copy too (e.g. "most recent" vs "largest"), so don't build 3 different
-  orders by accident by copy-pasting without deciding first.
+- **Ordering — DECIDED 2026-08-21: user-toggleable, not a fixed default.**
+  Rejected all three originally-proposed fixed orders (most recent /
+  strongest magnitude / nearest-to-viewport-center) in favor of two
+  simple toggle buttons ("Recientes"/"Magnitud" or similar — exact i18n
+  copy TBD) letting the user pick between chronological and magnitude
+  sort themselves. One shared sort-mode state/control, reused identically
+  across all 3 tabs' lists — not three separate implementations.
 - **Open technical question, check before or during implementation:**
   does `CountryMapCard` recompute the map projection/paths on every
   `mapView` tab switch even though the underlying boundary/projection
@@ -575,6 +612,8 @@ tackle it in disciplined pieces with individual commits per sub-piece
 (each still requires asking before pushing, per the standing rule at the
 top of this file) rather than one large uncommitted pass — easier to
 isolate and revert if a specific piece goes wrong.
+
+</details>
 
 ## 7. GitHub API boundary-fetch caching — DONE
 
