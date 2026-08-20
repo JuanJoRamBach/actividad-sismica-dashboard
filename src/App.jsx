@@ -1249,11 +1249,23 @@ export default function App() {
   const cutoff = Date.now() - RANGE_MS[range];
   const granularity = range === "day" ? "hour" : range === "year" ? "week" : "day";
 
+  /* Deliberately NOT keyed on activeCountries: filtering over Object.keys(data)   */
+  /* instead means adding/removing a country never invalidates the filtered arrays */
+  /* for every OTHER already-loaded country. It used to be keyed on activeCountries,*/
+  /* which meant removing one country rebuilt brand-new event arrays for every      */
+  /* remaining one (even though their underlying data hadn't changed) — those new   */
+  /* references then cascaded into CountryMapCard's own memoization (projected,     */
+  /* densityData, regionCounts), forcing the whole per-country pipeline, KDE        */
+  /* included, to recompute on a completely unrelated removal. That's the real      */
+  /* cause of "removing a country freezes the page." data[] itself already only     */
+  /* holds countries that have been loaded (via handleAdd's load(id)) and is never  */
+  /* pruned on remove, so this costs a little unused memory for a removed-but-      */
+  /* still-loaded country, not extra fetches or recomputation elsewhere.            */
   const filtered = useMemo(() => {
     const out = {};
-    activeCountries.forEach((id) => { out[id] = (data[id] || []).filter((e) => e.time >= cutoff).sort((a, b) => a.time - b.time); });
+    Object.keys(data).forEach((id) => { out[id] = (data[id] || []).filter((e) => e.time >= cutoff).sort((a, b) => a.time - b.time); });
     return out;
-  }, [data, cutoff, activeCountries]);
+  }, [data, cutoff]);
 
   const lineData = (id) => (filtered[id] || []).map((e) => ({ x: e.time, mag: e.mag, place: e.place }));
 
