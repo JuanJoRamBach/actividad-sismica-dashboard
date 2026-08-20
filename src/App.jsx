@@ -764,9 +764,19 @@ function regionColor(C, v, max) {
 /* the currently-selected region's own list; Epicentros/Densidad pass every event */
 /* currently on the map); the sort toggle and collapse behavior are identical     */
 /* everywhere, not three separate implementations of the same idea.               */
+/* A country like Chile/Japan/Indonesia over "Último año" can have 500+ events —  */
+/* nobody wants to scroll a 130px box through that many, and it's a real DOM-node */
+/* cost for no benefit once you're well past what anyone will actually scroll to. */
+/* Capped, not hidden silently: shows exactly how many are cut off, and the cap   */
+/* applies AFTER sorting, so "top 100 by magnitude" or "100 most recent" is still */
+/* the true top 100 — this only trims the list widget, never the map itself      */
+/* (bubbles/density still render every real event, this is a display-only cap).  */
+const EVENT_LIST_DISPLAY_CAP = 100;
+
 function EventListPanel({ id, C, t, title, count, events, collapsed, onToggleCollapse, sortMode, onSortChange, emptyText, hint, onEventClick, forceCollapsed, placeholderHint }) {
   const isCollapsed = collapsed;
   const sorted = useMemo(() => sortEvents(events, sortMode), [events, sortMode]);
+  const visible = sorted.length > EVENT_LIST_DISPLAY_CAP ? sorted.slice(0, EVENT_LIST_DISPLAY_CAP) : sorted;
   return (
     <div style={{
       position: "absolute", left: 8, bottom: 8, width: 200,
@@ -806,7 +816,7 @@ function EventListPanel({ id, C, t, title, count, events, collapsed, onToggleCol
             </div>
             {hint && <div style={{ fontSize: 9, color: C.textFaint, padding: "0 10px 5px" }}>{hint}</div>}
             <div style={{ height: 130, overflowY: "auto", padding: "0 6px 8px", display: "flex", flexDirection: "column", gap: 1 }}>
-              {sorted.map((p, i) => (
+              {visible.map((p, i) => (
                 <button key={p.id || i} onClick={() => onEventClick(p)}
                   style={{ display: "block", textAlign: "left", background: "none", border: "none", cursor: "pointer", borderRadius: 6, padding: "5px 4px", width: "100%" }}
                   onMouseEnter={(ev) => { ev.currentTarget.style.background = withAlpha(C.text, 0.06); }}
@@ -818,6 +828,11 @@ function EventListPanel({ id, C, t, title, count, events, collapsed, onToggleCol
                 </button>
               ))}
             </div>
+            {sorted.length > EVENT_LIST_DISPLAY_CAP && (
+              <div style={{ fontSize: 9, color: C.textFaint, padding: "0 10px 8px", fontStyle: "italic" }}>
+                {t.epicenterListTruncated(EVENT_LIST_DISPLAY_CAP, sorted.length)}
+              </div>
+            )}
           </>
         ) : (
           <div style={{ fontSize: 10.5, color: C.textFaint, padding: "0 10px 12px" }}>{emptyText}</div>
@@ -845,7 +860,10 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
   /* (mapView didn't clear it) — a stale "Región X selected" popup floating over   */
   /* the Density surface makes no sense once you've left the Regions tab.         */
   useEffect(() => { setPopup(null); }, [mapView]);
-  const [listCollapsed, setListCollapsed] = useState(false);
+  /* Closed by default on all 3 tabs — the panel opening on its own (whether on   */
+  /* first mount or from a click) was flagged as wrong; it should stay exactly    */
+  /* where the user last left it, closed until THEY choose to open it.           */
+  const [listCollapsed, setListCollapsed] = useState(true);
   const [sortMode, setSortMode] = useState("time");
   const svgRef = useRef(null);
   const zoomBehaviorRef = useRef(null);
@@ -999,10 +1017,14 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
     });
   }, [adm1, events, path]);
   const maxRegionCount = regionCounts ? Math.max(1, ...regionCounts.map((r) => r.count)) : 1;
-  /* Pinned (clicked), not just hovered — a hover-only preview shouldn't drive the  */
-  /* docked list panel below, or moving the mouse across the map would constantly  */
-  /* flicker its contents. Only a deliberate click "selects" a region.             */
-  const selectedRegion = popup && popup.kind === "region" && popup.pinned ? popup.region : null;
+  /* Its own state, deliberately NOT derived from the hover popup — a click used to */
+  /* "pin" the floating popup open (stick around after the mouse left), which the   */
+  /* user correctly flagged as wrong: hover should ONLY ever show the small         */
+  /* floating card, and clicking should ONLY ever affect the docked list panel      */
+  /* below, never leave the floating card stuck on screen. So there's no more       */
+  /* "pinned" concept at all — the floating popup is purely a hover preview now,    */
+  /* and region selection (which drives the docked panel) is tracked separately.   */
+  const [selectedRegion, setSelectedRegion] = useState(null);
 
   if (adm0Status === "loading") {
     return <div style={{ height: H * 0.5, display: "flex", alignItems: "center", justifyContent: "center", color: C.textFaint, fontSize: 12.5 }}>{t.loadingBoundary}</div>;
@@ -1018,8 +1040,7 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
   return (
     <div style={{ position: "relative" }}>
       <div style={{ position: "relative" }}>
-      <svg ref={attachZoom} viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: cssHeight, background: "rgba(128,128,128,0.04)", borderRadius: 10, touchAction: "none", cursor: k > 1.001 ? "grab" : "default" }}
-        onClick={() => setPopup((p) => (p && p.pinned ? null : p))}>
+      <svg ref={attachZoom} viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: cssHeight, background: "rgba(128,128,128,0.04)", borderRadius: 10, touchAction: "none", cursor: k > 1.001 ? "grab" : "default" }}>
         <g transform="translate(8,8)">
           <g transform={transform.toString()}>
             {mapView === "regions" && regionCounts && regionCounts.map((r, i) => {
@@ -1029,9 +1050,9 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
                 <path key={i} d={r.d} fill={regionColor(C, r.count, maxRegionCount)}
                   stroke={isHovered ? C.text : withAlpha(C.text, 0.15)} strokeWidth={(isHovered ? 1.4 : 0.5) / k}
                   style={{ cursor: "pointer" }}
-                  onMouseEnter={() => { if (!(popup && popup.pinned)) setPopup({ kind: "region", region: { name, count: r.count, events: r.events }, x: r.cx, y: r.cy, pinned: false }); }}
-                  onMouseLeave={() => setPopup((pp) => (pp && pp.pinned ? pp : null))}
-                  onClick={(ev) => { ev.stopPropagation(); setPopup({ kind: "region", region: { name, count: r.count, events: r.events }, x: r.cx, y: r.cy, pinned: true }); setListCollapsed(false); }} />
+                  onMouseEnter={() => setPopup({ kind: "region", region: { name, count: r.count, events: r.events }, x: r.cx, y: r.cy })}
+                  onMouseLeave={() => setPopup(null)}
+                  onClick={(ev) => { ev.stopPropagation(); setSelectedRegion({ name, count: r.count, events: r.events }); }} />
               );
             })}
             {mapView === "regions" && adm1Status === "loading" && (
@@ -1045,8 +1066,8 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
               return (
                 <circle key={i} cx={p.x} cy={p.y} r={r} fill={C.dotRed} fillOpacity={0.85} stroke={withAlpha(C.bg, 0.6)} strokeWidth={0.6 / k}
                   style={{ cursor: "pointer" }}
-                  onMouseEnter={() => setPopup((pp) => (pp && pp.pinned ? pp : { kind: "event", event: p, x: p.x, y: p.y, pinned: false }))}
-                  onMouseLeave={() => setPopup((pp) => (pp && pp.pinned ? pp : null))}
+                  onMouseEnter={() => setPopup({ kind: "event", event: p, x: p.x, y: p.y })}
+                  onMouseLeave={() => setPopup(null)}
                   onClick={(ev) => { ev.stopPropagation(); if (p.id) window.open(usgsEventUrl(p.id), "_blank", "noopener,noreferrer"); }} />
               );
             })}
@@ -1090,8 +1111,8 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
                   <circle key={`ep-${i}`} cx={p.x} cy={p.y} r={Math.min(3.2, Math.max(1.5, (p.radiusPx || 20) * 0.055))}
                     fill={`url(#epicenter-${id})`} stroke={C.text} strokeWidth={0.5 / k} strokeOpacity={0.5}
                     style={{ cursor: "pointer" }}
-                    onMouseEnter={() => setPopup((pp) => (pp && pp.pinned ? pp : { kind: "event", event: p, x: p.x, y: p.y, pinned: false }))}
-                    onMouseLeave={() => setPopup((pp) => (pp && pp.pinned ? pp : null))}
+                    onMouseEnter={() => setPopup({ kind: "event", event: p, x: p.x, y: p.y })}
+                    onMouseLeave={() => setPopup(null)}
                     onClick={(ev) => { ev.stopPropagation(); if (p.id) window.open(usgsEventUrl(p.id), "_blank", "noopener,noreferrer"); }} />
                 ))}
                 {projected.map((p, i) => (
@@ -1117,9 +1138,8 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
           top: `${((8 + transform.applyY(popup.y)) / H) * 100}%`,
           transform: "translate(-50%, -115%)", background: C.surface, border: `1px solid ${C.surfaceBorder}`,
           borderRadius: 10, padding: "10px 12px", minWidth: 190, maxWidth: 260, boxShadow: `0 8px 24px ${C.surfaceShadow}`, zIndex: 5,
-          pointerEvents: popup.pinned ? "auto" : "none",
+          pointerEvents: "none",
         }}>
-          {popup.pinned && <button onClick={() => setPopup(null)} aria-label="Close" style={{ position: "absolute", top: 4, right: 6, background: "none", border: "none", color: C.textFaint, fontSize: 14, cursor: "pointer", lineHeight: 1 }}>×</button>}
           {popup.kind === "region" ? (
             /* Just name + count here — the full event list lives in the docked   */
             /* EventListPanel below now (see "the region popup BECOMES this tab's */
