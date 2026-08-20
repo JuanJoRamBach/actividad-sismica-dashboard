@@ -26,6 +26,27 @@ function sortEvents(events, mode) {
   return arr;
 }
 
+/* Caps how many events actually get RENDERED on the map (bubbles, density KDE +  */
+/* markers + the per-marker "breathe" pulsar CSS animation, region containment    */
+/* checks) — not just the sidebar list, which was the wrong place to cap: a       */
+/* high-activity country (Japan) over a long range plus an existing one (Chile)   */
+/* both uncapped meant hundreds to a thousand+ simultaneously-animating SVG       */
+/* elements across 2-3 country cards at once, which is a real, severe cost        */
+/* regardless of how fast any single computation is. Ordered cap, top-100-by-     */
+/* magnitude first (test at 100; drop to 50 if still too slow) — NOT the earlier  */
+/* spatial-clustering approach used for the Density surface's OWN internal grid   */
+/* computation (that stays as-is, it's a different problem: reducing redundant    */
+/* KDE splats for a fixed point set, not reducing how many points/markers exist   */
+/* in the first place). This never touches filtered[id] itself — period-summary   */
+/* stats, charts, and Epicentros' own magnitude/count figures elsewhere in the    */
+/* app still reflect the TRUE full dataset; only what CountryMapCard renders is   */
+/* capped.                                                                        */
+const MAP_EVENT_CAP = 100;
+function capEventsForMap(events, cap) {
+  if (events.length <= cap) return events;
+  return events.slice().sort((a, b) => b.mag - a.mag).slice(0, cap);
+}
+
 const EARTH_RADIUS_KM = 6371;
 /* Great-circle destination point, given a start point, distance, and bearing  */
 /* (standard spherical formula) — used to measure "how many pixels is N km,    */
@@ -773,7 +794,7 @@ function regionColor(C, v, max) {
 /* (bubbles/density still render every real event, this is a display-only cap).  */
 const EVENT_LIST_DISPLAY_CAP = 100;
 
-function EventListPanel({ id, C, t, title, count, events, collapsed, onToggleCollapse, sortMode, onSortChange, emptyText, hint, onEventClick, forceCollapsed, placeholderHint }) {
+function EventListPanel({ id, C, t, title, count, totalCount, events, collapsed, onToggleCollapse, sortMode, onSortChange, emptyText, hint, onEventClick, forceCollapsed, placeholderHint }) {
   const isCollapsed = collapsed;
   const sorted = useMemo(() => sortEvents(events, sortMode), [events, sortMode]);
   const visible = sorted.length > EVENT_LIST_DISPLAY_CAP ? sorted.slice(0, EVENT_LIST_DISPLAY_CAP) : sorted;
@@ -828,7 +849,17 @@ function EventListPanel({ id, C, t, title, count, events, collapsed, onToggleCol
                 </button>
               ))}
             </div>
-            {sorted.length > EVENT_LIST_DISPLAY_CAP && (
+            {/* totalCount is set when the MAP itself is already capped upstream         */}
+            {/* (capEventsForMap, top-100-strongest) — show that as "strongest of N"      */}
+            {/* rather than the generic list-only truncation note, since that's the       */}
+            {/* actually-true reason fewer than the full count are shown here. Falls back */}
+            {/* to the plain list-only cap (Regiones, which isn't capped upstream) when    */}
+            {/* totalCount isn't provided.                                                */}
+            {totalCount !== undefined && totalCount > count ? (
+              <div style={{ fontSize: 9, color: C.textFaint, padding: "0 10px 8px", fontStyle: "italic" }}>
+                {t.epicenterListCappedByMagnitude(count, totalCount)}
+              </div>
+            ) : sorted.length > EVENT_LIST_DISPLAY_CAP && (
               <div style={{ fontSize: 9, color: C.textFaint, padding: "0 10px 8px", fontStyle: "italic" }}>
                 {t.epicenterListTruncated(EVENT_LIST_DISPLAY_CAP, sorted.length)}
               </div>
@@ -971,9 +1002,15 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
 
   const path = useMemo(() => (projection ? geoPath(projection) : null), [projection]);
 
+  /* Ordered cap (see capEventsForMap above) — everything the map actually renders */
+  /* (bubbles, density markers/pulsar, region containment) uses this capped set,   */
+  /* not the raw events prop. Period-summary stats/charts elsewhere in the app     */
+  /* still use the true filtered[id] directly, unaffected.                        */
+  const mapEvents = useMemo(() => capEventsForMap(events, MAP_EVENT_CAP), [events]);
+
   const projected = useMemo(() => {
     if (!projection) return [];
-    return events.map((e) => {
+    return mapEvents.map((e) => {
       const p = projection([e.lon, e.lat]);
       if (!p) return null;
       /* Felt-radius in real km, converted to THIS projection's pixels by       */
@@ -984,9 +1021,9 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
       const radiusPx = edge ? Math.hypot(edge[0] - p[0], edge[1] - p[1]) : 20;
       return { ...e, x: p[0] + 8, y: p[1] + 8, radiusPx };
     }).filter(Boolean);
-  }, [projection, events]);
+  }, [projection, mapEvents]);
 
-  const maxMag = Math.max(1, ...events.map((e) => e.mag));
+  const maxMag = Math.max(1, ...mapEvents.map((e) => e.mag));
 
   /* Same "compute once, keep across tab switches" fix as regionCounts below —   */
   /* densityVisited mirrors what adm1 does for Regions: adm1 only gets populated */
@@ -1008,6 +1045,14 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
     return computeDensityContours(densityPts, W - 16, H - 16);
   }, [densityVisited, densityPts, W, H]);
 
+  /* Deliberately the FULL events here, not the capped mapEvents — a choropleth's  */
+  /* whole point is showing accurate regional distribution, and capping to the    */
+  /* top-100-strongest nationally would make a region full of small aftershocks   */
+  /* look empty just because none of them individually crack the national top     */
+  /* 100. The per-region event LIST (via the docked panel) still has its own      */
+  /* separate, smaller safety-net cap (EVENT_LIST_DISPLAY_CAP) if a single region */
+  /* somehow has 100+ events of its own, which is far less likely than a whole    */
+  /* country doing so.                                                            */
   const regionCounts = useMemo(() => {
     if (!adm1 || !path) return null;
     return adm1.features.map((f) => {
@@ -1168,7 +1213,7 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
       )}
       {(mapView === "density" || mapView === "bubbles") && (
         <EventListPanel id={id} C={C} t={t}
-          title={t.epicenterListTitle} count={projected.length} events={projected}
+          title={t.epicenterListTitle} count={projected.length} totalCount={events.length} events={projected}
           collapsed={listCollapsed} onToggleCollapse={() => setListCollapsed((v) => !v)}
           sortMode={sortMode} onSortChange={setSortMode}
           emptyText={t.epicenterListEmpty} hint={t.epicenterListHint} onEventClick={zoomToEvent} />
@@ -1194,9 +1239,9 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8, fontSize: 11, color: C.textDim }}>
           <span>{t.bubblesLegendLabel}</span>
           <span style={{ width: 4, height: 4, borderRadius: "50%", background: C.dotRed, flexShrink: 0 }} />
-          <span>M{events.length ? Math.min(...events.map((e) => e.mag)).toFixed(1) : "–"}</span>
+          <span>M{mapEvents.length ? Math.min(...mapEvents.map((e) => e.mag)).toFixed(1) : "–"}</span>
           <span style={{ width: 9, height: 9, borderRadius: "50%", background: C.dotRed, flexShrink: 0 }} />
-          <span>M{events.length ? maxMag.toFixed(1) : "–"}</span>
+          <span>M{mapEvents.length ? maxMag.toFixed(1) : "–"}</span>
         </div>
       )}
       {mapView === "regions" && regionCounts && (
