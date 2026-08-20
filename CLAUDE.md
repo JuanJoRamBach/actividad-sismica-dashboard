@@ -2,6 +2,17 @@
 
 Context for Claude Code working on this repo. Read this before making changes.
 
+## Working with the user
+
+**The user does visual/manual testing themselves — don't drive the browser to
+"verify" a UI change unless they explicitly ask you to.** Automated checks
+(build, pixel-sampling a canvas render, DOM/state assertions via
+`javascript_tool`) are fine and encouraged to confirm a fix is technically
+correct. But do not open a screenshot, click through the UI, or narrate "let
+me verify this visually" as a default step after every change — hand it back
+and let the user look at it. If they say "let me test" or similar, stop
+driving the browser immediately, even mid-check.
+
 ## What this is
 
 "Actividad Sísmica" — a real-time seismic activity dashboard. Shows live earthquake

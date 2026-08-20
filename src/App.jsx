@@ -1,11 +1,53 @@
-import React, { useState, useEffect, useMemo, useCallback } from "react";
+import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import {
   LineChart, Line, AreaChart, Area, BarChart, Bar, ScatterChart, Scatter,
   PieChart, Pie, Cell, XAxis, YAxis, ZAxis, CartesianGrid, Tooltip, Legend,
   ResponsiveContainer,
 } from "recharts";
 import { geoMercator, geoPath, geoContains, geoArea } from "d3-geo";
+import { contours as d3contours } from "d3-contour";
+import { interpolateHcl } from "d3-interpolate";
+import { zoom as d3zoom, zoomIdentity } from "d3-zoom";
+import { select as d3select } from "d3-selection";
+import "d3-transition";
 import { STRINGS, detectLang } from "./i18n.js";
+
+function usgsEventUrl(eventId) { return `https://earthquake.usgs.gov/earthquakes/eventpage/${eventId}`; }
+
+const EARTH_RADIUS_KM = 6371;
+/* Great-circle destination point, given a start point, distance, and bearing  */
+/* (standard spherical formula) — used to measure "how many pixels is N km,    */
+/* at this specific point on this specific projection" by projecting both the */
+/* origin and a point N km away, rather than assuming a flat km-per-pixel      */
+/* conversion (Mercator's scale varies with latitude, and every country here   */
+/* uses its own fitted projection).                                           */
+function destinationPoint(lon, lat, distanceKm, bearingDeg) {
+  const delta = distanceKm / EARTH_RADIUS_KM;
+  const theta = (bearingDeg * Math.PI) / 180;
+  const phi1 = (lat * Math.PI) / 180, lambda1 = (lon * Math.PI) / 180;
+  const phi2 = Math.asin(Math.sin(phi1) * Math.cos(delta) + Math.cos(phi1) * Math.sin(delta) * Math.cos(theta));
+  const lambda2 = lambda1 + Math.atan2(
+    Math.sin(theta) * Math.sin(delta) * Math.cos(phi1),
+    Math.cos(delta) - Math.sin(phi1) * Math.sin(phi2)
+  );
+  return [(lambda2 * 180) / Math.PI, (phi2 * 180) / Math.PI];
+}
+/* Empirical magnitude -> "felt radius" curve (km) — a log-linear fit to rough */
+/* real-world felt-area anchors (M3 ~15km, barely felt locally; M8.5+ ~500km+, */
+/* strongly felt across an entire region — matching e.g. the 2010 and 2016     */
+/* Chile megaquakes). This is a visualization heuristic, not a seismological   */
+/* instrument, but it's grounded in real relative scale rather than arbitrary  */
+/* — so the density map's glow size actually means something physical instead  */
+/* of every event getting the same fixed splat regardless of how big it was.   */
+function feltRadiusKm(mag) {
+  return Math.pow(10, 0.345 + 0.277 * mag);
+}
+function zoomBtnStyle(C) {
+  return {
+    width: 24, height: 24, borderRadius: 6, border: `1px solid ${C.border}`, background: C.surface, color: C.text,
+    fontSize: 14, lineHeight: 1, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", padding: 0,
+  };
+}
 
 /* ---------------------------------------------------------------------- */
 /* TEMAS — Vampiric Crimson (noche) y Atlas de Campo (día). Cianotipo se  */
@@ -17,18 +59,20 @@ const THEMES = {
     bg: "#0B0C10", border: "rgba(255,255,255,0.035)", borderHover: "rgba(255,255,255,0.09)", grid: "#252525",
     text: "#EDEAE7", textDim: "#9C9591", textFaint: "#84807B",
     bloodRed: "#8B0000", rose: "#A92424", dotRed: "#FF6B4C",
-    heatLow: "#3A0A0A", heatMid: "#B2231F", heatHigh: "#FF1F8F",
+    heatLow: "#3B0066", heatMid: "#6600CC", heatHigh: "#9D4EDD",
     alertGreen: "#3FD17A", alertYellow: "#D8B93A", alertOrange: "#E0722A", alertRed: "#8B0000", alertNone: "#8C8680",
     palette: ["#2DD8C9", "#B860F5", "#E8A23A"], cardTint: "rgba(255,255,255,0.012)", glowAlpha: [0.28, 0.10],
+    surface: "#161217", surfaceBorder: "rgba(255,255,255,0.12)", surfaceShadow: "rgba(0,0,0,0.5)",
   },
   atlas: {
     name: "Atlas de Campo", mode: "light",
     bg: "#F2ECDC", border: "rgba(36,31,26,0.10)", borderHover: "rgba(36,31,26,0.22)", grid: "#D9CFB8",
     text: "#241F1A", textDim: "#5C5346", textFaint: "#655D4D",
     bloodRed: "#8B2318", rose: "#A8481F", dotRed: "#6B3A56",
-    heatLow: "#2A1608", heatMid: "#A8481F", heatHigh: "#E8B23A",
+    heatLow: "#C9A6E8", heatMid: "#8B3DC9", heatHigh: "#3B0066",
     alertGreen: "#2F6B38", alertYellow: "#8C6D1F", alertOrange: "#A34E1C", alertRed: "#8B2318", alertNone: "#9C9187",
     palette: ["#2E4374", "#A8481F", "#7A6624"], cardTint: "rgba(36,31,26,0.035)", glowAlpha: [0.07, 0.04],
+    surface: "#FBF7EC", surfaceBorder: "rgba(36,31,26,0.14)", surfaceShadow: "rgba(36,31,26,0.18)",
   },
 };
 const ThemeContext = React.createContext(THEMES.crimson);
@@ -43,21 +87,31 @@ const MAX_COUNTRIES = 3;
 /* ---------------------------------------------------------------------- */
 const COUNTRY_REGISTRY = {
   chile:     { label: "Chile", iso3: "CHL", bbox: { minlatitude: -56, maxlatitude: -17, minlongitude: -76, maxlongitude: -66 }, matches: ["chile"], tz: "America/Santiago", locale: "es-CL", activity: "high", depthProfile: "subduction", tall: true },
-  spain:     { label: "España", iso3: "ESP", bbox: { minlatitude: 27, maxlatitude: 44, minlongitude: -19, maxlongitude: 5 }, matches: ["spain"], tz: "Europe/Madrid", locale: "es-ES", activity: "medium", depthProfile: "shallow" },
-  mexico:    { label: "México", iso3: "MEX", bbox: { minlatitude: 14, maxlatitude: 33, minlongitude: -118, maxlongitude: -86 }, matches: ["mexico"], tz: "America/Mexico_City", locale: "es-ES", activity: "high", depthProfile: "subduction" },
-  peru:      { label: "Perú", iso3: "PER", bbox: { minlatitude: -19, maxlatitude: 0, minlongitude: -82, maxlongitude: -68 }, matches: ["peru"], tz: "America/Lima", locale: "es-ES", activity: "high", depthProfile: "subduction" },
-  japan:     { label: "Japón", iso3: "JPN", bbox: { minlatitude: 24, maxlatitude: 46, minlongitude: 123, maxlongitude: 146 }, matches: ["japan"], tz: "Asia/Tokyo", locale: "es-ES", activity: "high", depthProfile: "subduction", tall: true },
+  spain:     { label: "España", labelEn: "Spain", iso3: "ESP", bbox: { minlatitude: 27, maxlatitude: 44, minlongitude: -19, maxlongitude: 5 }, matches: ["spain"], tz: "Europe/Madrid", locale: "es-ES", activity: "medium", depthProfile: "shallow" },
+  mexico:    { label: "México", labelEn: "Mexico", iso3: "MEX", bbox: { minlatitude: 14, maxlatitude: 33, minlongitude: -118, maxlongitude: -86 }, matches: ["mexico"], tz: "America/Mexico_City", locale: "es-ES", activity: "high", depthProfile: "subduction" },
+  peru:      { label: "Perú", labelEn: "Peru", iso3: "PER", bbox: { minlatitude: -19, maxlatitude: 0, minlongitude: -82, maxlongitude: -68 }, matches: ["peru"], tz: "America/Lima", locale: "es-ES", activity: "high", depthProfile: "subduction" },
+  japan:     { label: "Japón", labelEn: "Japan", iso3: "JPN", bbox: { minlatitude: 24, maxlatitude: 46, minlongitude: 123, maxlongitude: 146 }, matches: ["japan"], tz: "Asia/Tokyo", locale: "es-ES", activity: "high", depthProfile: "subduction", tall: true },
   indonesia: { label: "Indonesia", iso3: "IDN", bbox: { minlatitude: -11, maxlatitude: 6, minlongitude: 95, maxlongitude: 141 }, matches: ["indonesia"], tz: "Asia/Jakarta", locale: "es-ES", activity: "high", depthProfile: "subduction" },
-  turkey:    { label: "Turquía", iso3: "TUR", bbox: { minlatitude: 36, maxlatitude: 42, minlongitude: 26, maxlongitude: 45 }, matches: ["turkey"], tz: "Europe/Istanbul", locale: "es-ES", activity: "medium", depthProfile: "shallow" },
-  italy:     { label: "Italia", iso3: "ITA", bbox: { minlatitude: 36, maxlatitude: 47, minlongitude: 6, maxlongitude: 19 }, matches: ["italy"], tz: "Europe/Rome", locale: "es-ES", activity: "medium", depthProfile: "shallow", tall: true },
-  greece:    { label: "Grecia", iso3: "GRC", bbox: { minlatitude: 34, maxlatitude: 42, minlongitude: 19, maxlongitude: 30 }, matches: ["greece"], tz: "Europe/Athens", locale: "es-ES", activity: "medium", depthProfile: "shallow" },
+  turkey:    { label: "Turquía", labelEn: "Turkey", iso3: "TUR", bbox: { minlatitude: 36, maxlatitude: 42, minlongitude: 26, maxlongitude: 45 }, matches: ["turkey"], tz: "Europe/Istanbul", locale: "es-ES", activity: "medium", depthProfile: "shallow" },
+  italy:     { label: "Italia", labelEn: "Italy", iso3: "ITA", bbox: { minlatitude: 36, maxlatitude: 47, minlongitude: 6, maxlongitude: 19 }, matches: ["italy"], tz: "Europe/Rome", locale: "es-ES", activity: "medium", depthProfile: "shallow", tall: true },
+  greece:    { label: "Grecia", labelEn: "Greece", iso3: "GRC", bbox: { minlatitude: 34, maxlatitude: 42, minlongitude: 19, maxlongitude: 30 }, matches: ["greece"], tz: "Europe/Athens", locale: "es-ES", activity: "medium", depthProfile: "shallow" },
   ecuador:   { label: "Ecuador", iso3: "ECU", bbox: { minlatitude: -5, maxlatitude: 2, minlongitude: -81, maxlongitude: -75 }, matches: ["ecuador"], tz: "America/Guayaquil", locale: "es-ES", activity: "medium", depthProfile: "subduction" },
   colombia:  { label: "Colombia", iso3: "COL", bbox: { minlatitude: -4, maxlatitude: 13, minlongitude: -79, maxlongitude: -66 }, matches: ["colombia"], tz: "America/Bogota", locale: "es-ES", activity: "medium", depthProfile: "subduction" },
   portugal:  { label: "Portugal", iso3: "PRT", bbox: { minlatitude: 36, maxlatitude: 42, minlongitude: -10, maxlongitude: -6 }, matches: ["portugal"], tz: "Europe/Lisbon", locale: "es-ES", activity: "low", depthProfile: "shallow" },
-  iceland:   { label: "Islandia", iso3: "ISL", bbox: { minlatitude: 63, maxlatitude: 67, minlongitude: -25, maxlongitude: -13 }, matches: ["iceland"], tz: "Atlantic/Reykjavik", locale: "es-ES", activity: "medium", depthProfile: "mixed" },
-  usa_ca:    { label: "EE. UU. (California)", iso3: "USA", bbox: { minlatitude: 32, maxlatitude: 42, minlongitude: -125, maxlongitude: -114 }, matches: [", ca", "california"], tz: "America/Los_Angeles", locale: "es-ES", activity: "medium", depthProfile: "shallow" },
+  iceland:   { label: "Islandia", labelEn: "Iceland", iso3: "ISL", bbox: { minlatitude: 63, maxlatitude: 67, minlongitude: -25, maxlongitude: -13 }, matches: ["iceland"], tz: "Atlantic/Reykjavik", locale: "es-ES", activity: "medium", depthProfile: "mixed" },
+  usa_ca:    { label: "EE. UU. (California)", labelEn: "USA (California)", iso3: "USA", bbox: { minlatitude: 32, maxlatitude: 42, minlongitude: -125, maxlongitude: -114 }, matches: [", ca", "california"], tz: "America/Los_Angeles", locale: "es-ES", activity: "medium", depthProfile: "shallow" },
 };
 const DEFAULT_ACTIVE = ["chile", "spain"];
+
+/* COUNTRY_REGISTRY.label is Spanish-only (it's config data, not a UI string   */
+/* pulled through STRINGS) — without this, English mode showed "España",      */
+/* "México", "Japón" etc. next to otherwise-English UI text. labelEn is only   */
+/* set where the English name actually differs from the Spanish one.          */
+function countryLabel(id, lang) {
+  const cfg = COUNTRY_REGISTRY[id];
+  if (!cfg) return id;
+  return lang === "en" && cfg.labelEn ? cfg.labelEn : cfg.label;
+}
 
 /* ---------------------------------------------------------------------- */
 /* RNG determinista para datos de respaldo (si la API no responde)        */
@@ -72,7 +126,7 @@ function mulberry32(seed) {
 }
 function hashSeed(str) { let h = 0; for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) | 0; return h || 1; }
 
-function generateFallback(id) {
+function generateFallback(id, lang) {
   const cfg = COUNTRY_REGISTRY[id];
   const rng = mulberry32(hashSeed(id));
   const now = Date.now();
@@ -95,7 +149,7 @@ function generateFallback(id) {
     const alert = magClamped < 4 ? "none" : alertRoll < 0.55 ? "none" : alertRoll < 0.8 ? "green" : alertRoll < 0.93 ? "yellow" : alertRoll < 0.985 ? "orange" : "red";
     events.push({
       id: `${id}-fb-${i}`, mag: +magClamped.toFixed(1), magType: magClamped > 4.5 ? "mw" : "ml",
-      place: `${cfg.label} (estimado)`, time: t, alert,
+      place: `${countryLabel(id, lang)} (${lang === "en" ? "estimated" : "estimado"})`, time: t, alert,
       felt: alertRoll > 0.85 ? Math.round(rng() * 400) : 0, sig: Math.round(magClamped * 100),
       depth: +depth.toFixed(1), lat, lon, country: id,
     });
@@ -155,6 +209,34 @@ function toMediaGithubUsercontent(url) {
   return m ? { owner: m[1], repo: m[2], ref: m[3], path: m[4] } : null;
 }
 
+/* geoBoundaries' shapeName strings are shipped already double-UTF-8-encoded in    */
+/* the source files themselves (confirmed by inspecting the raw response bytes —   */
+/* not a decoding bug on our end, fetch's .json() always reads UTF-8 correctly).   */
+/* Each accented char got its correct UTF-8 bytes re-encoded a second time as if   */
+/* they were Latin-1, e.g. "ó" (bytes C3 B3) became the two characters "Ã" + "³"   */
+/* (codepoints C3, B3 read back as Latin-1). Reversing it: read each JS char's     */
+/* codepoint back as a raw byte, then UTF-8-decode that byte sequence for real.    */
+function fixMojibake(str) {
+  if (typeof str !== "string" || !/[-ÿ]/.test(str)) return str;
+  if (/[^\u0000-ÿ]/.test(str)) return str;
+  try {
+    const bytes = Uint8Array.from(str, (c) => c.charCodeAt(0));
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return str;
+  }
+}
+
+function fixShapeNames(gj) {
+  if (!gj || !Array.isArray(gj.features)) return gj;
+  gj.features.forEach((f) => {
+    if (f.properties && typeof f.properties.shapeName === "string") {
+      f.properties.shapeName = fixMojibake(f.properties.shapeName);
+    }
+  });
+  return gj;
+}
+
 async function fetchBoundary(iso3, level) {
   const metaRes = await fetch(`https://www.geoboundaries.org/api/current/gbOpen/${iso3}/${level}/`);
   if (!metaRes.ok) throw new Error("meta");
@@ -172,7 +254,7 @@ async function fetchBoundary(iso3, level) {
   const geomRes = await fetch(finalUrl);
   if (!geomRes.ok) throw new Error("geom");
   const gj = await geomRes.json();
-  return fixRingWinding(gj);
+  return fixRingWinding(fixShapeNames(gj));
 }
 
 /* geoBoundaries' ADM0 files ship with every disjoint ring (mainland, each island)  */
@@ -312,8 +394,11 @@ function DayNightToggle({ mode, onToggle }) {
 function StatChip({ label, value, accent }) {
   const C = React.useContext(ThemeContext);
   return (
-    <div className="chipHover" style={{ background: "rgba(128,128,128,0.06)", border: `1px solid ${C.border}`, borderRadius: 12, padding: "10px 14px", minWidth: 118, flex: "1 1 118px" }}>
-      <div style={{ fontSize: 11, color: C.textDim, textTransform: "uppercase", letterSpacing: 0.5 }}>{label}</div>
+    <div className="chipHover" style={{ background: "rgba(128,128,128,0.06)", border: `1px solid ${C.border}`, borderRadius: 12, padding: "10px 14px", minWidth: 118, flex: "1 1 118px", display: "flex", flexDirection: "column" }}>
+      {/* minHeight reserves room for a 2-line label (e.g. "MAX. MAGNITUDE") so the  */}
+      {/* value below starts at the same Y across every card in the row, regardless */}
+      {/* of whether THIS card's own label happens to wrap to 1 line or 2.          */}
+      <div style={{ fontSize: 11, color: C.textDim, textTransform: "uppercase", letterSpacing: 0.5, minHeight: 28, display: "flex", alignItems: "flex-start" }}>{label}</div>
       <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 19, color: accent || C.text, marginTop: 2 }}>{value}</div>
     </div>
   );
@@ -336,52 +421,262 @@ function StatusBadge({ status }) {
   );
 }
 
-function getTooltipStyle() { return { background: "#161217", border: "1px solid rgba(255,255,255,0.12)", borderRadius: 10, fontSize: 12.5, color: "#EDEAE7", padding: "8px 12px" }; }
+function getTooltipStyle(C) {
+  return { background: C.surface, border: `1px solid ${C.surfaceBorder}`, borderRadius: 10, fontSize: 12.5, color: C.text, padding: "8px 12px", boxShadow: `0 8px 24px ${C.surfaceShadow}` };
+}
+
+/* Foreground colors for alert-level text on the tooltip's own C.surface —   */
+/* distinct from C.alert* (tuned as badge/marker fills against the page bg), */
+/* verified separately so labels stay legible against the elevated surface   */
+/* in both themes.                                                          */
+const ALERT_SURFACE_TEXT = {
+  crimson: { green: "#7CE3A6", yellow: "#E8D577", orange: "#F2A366", red: "#FF6B6B", none: "#FFFFFF" },
+  atlas: { green: "#2F6B38", yellow: "#8C6D1F", orange: "#A34E1C", red: "#8B2318", none: "#5C5346" },
+};
 
 function AlertTooltip({ active, payload }) {
-  const ALERT_TEXT = { green: "#7CE3A6", yellow: "#E8D577", orange: "#F2A366", red: "#FF6B6B", none: "#FFFFFF" };
+  const C = React.useContext(ThemeContext);
+  const alertText = ALERT_SURFACE_TEXT[C.mode === "light" ? "atlas" : "crimson"];
   if (!active || !payload || !payload.length) return null;
   const p = payload[0].payload;
   return (
-    <div style={getTooltipStyle()}>
-      <span style={{ color: p.key === "none" ? "#FFFFFF" : ALERT_TEXT[p.key], fontWeight: 600 }}>{p.name}</span>
-      <span style={{ color: "#9C9591" }}> — {p.value}</span>
+    <div style={getTooltipStyle(C)}>
+      <span style={{ color: alertText[p.key], fontWeight: 600 }}>{p.name}</span>
+      <span style={{ color: C.textDim }}> — {p.value}</span>
     </div>
   );
 }
 
-function DensityField({ pts, w, h, uid, minR = 10, maxR = 30, blur = 9 }) {
+/* Real geographic density surface — a 2D kernel density estimate (KDE) over    */
+/* the event points, rendered as filled contour bands (same technique real      */
+/* mapping tools use for point-density heatmaps). Each point gets ITS OWN       */
+/* kernel radius (from `feltRadiusKm` via magnitude — see `projected` in        */
+/* CountryMapCard), which `d3.contourDensity()` can't do (one global bandwidth  */
+/* for every point). So this computes the density grid by hand: splat each      */
+/* point's own Gaussian onto a coarse grid (only within its own reach, not the  */
+/* whole grid — keeps this to O(points x own kernel area), not O(points x grid) */
+/* ), then hands the raw grid to `d3.contours()` (the lower-level generator     */
+/* that operates on a value array; `contourDensity` is the point-input wrapper  */
+/* around it that always uses one shared bandwidth). Contours are in ascending  */
+/* threshold order, so painting them low-to-high naturally layers smaller,      */
+/* hotter regions on top of larger, cooler ones with no extra work. Colored     */
+/* with heatRamp() (real published colormap data, red-locked, escalating       */
+/* toward the brightest/most saturated red — the highest-severity color        */
+/* everywhere else in this app) so band-to-band steps are real computed        */
+/* intensity, not visual noise from overlapping shapes.                       */
+function DensitySurface({ pts, w, h }) {
   const C = React.useContext(ThemeContext);
+  const cellPx = 3;
+  const { contours, padCells } = useMemo(() => {
+    if (pts.length < 1) return { contours: [], padCells: 0 };
+    const maxR = Math.max(20, ...pts.map((p) => p.r || 20));
+    /* Same reasoning as before: pad past any single point's own kernel reach so */
+    /* it fades near-zero before the true edge, instead of getting hard-cut.     */
+    const padCells = Math.ceil((maxR * 2.5) / cellPx);
+    const nx = Math.max(1, Math.ceil(w / cellPx)), ny = Math.max(1, Math.ceil(h / cellPx));
+    const gridW = nx + padCells * 2, gridH = ny + padCells * 2;
+    const grid = new Float64Array(gridW * gridH);
+    /* Max, not screen-blend, not a plain sum: screen-blend was meant to stop a    */
+    /* tight cluster's stacked peak from dwarfing an isolated event elsewhere —    */
+    /* but it has a side effect nothing here was accounting for. Screen-blending   */
+    /* several overlapping points doesn't just raise the PEAK, it inflates values  */
+    /* toward that ceiling across the whole SHARED area between them — for a      */
+    /* 4-point cluster, that's most of the cluster's footprint, not just its       */
+    /* center. That's what was making the glow look "solid all the way to the     */
+    /* edge" no matter how the alpha curve on top of it was tuned: the input was   */
+    /* already artificially flat over a wide area. max() keeps each point's own   */
+    /* natural Gaussian falloff intact — a real Gaussian IS already steep away     */
+    /* from its own center — and isolated-vs-cluster visibility is now handled    */
+    /* by the fixed-ceiling normalization below instead, not by inflating values.  */
+    pts.forEach((p) => {
+      /* Tighter kernel (0.35, was 0.45) — a tight cluster like Granada's four        */
+      /* events needs each one's OWN footprint narrow enough that they can still      */
+      /* read as separate bumps instead of one immediate merge into a single blob.    */
+      const sigmaPx = Math.max(3, (p.r || 20) * 0.35);
+      const sigmaCells = sigmaPx / cellPx;
+      /* High enough that a single strong isolated event reaches near-full on its    */
+      /* own (color/alpha are normalized against a FIXED ceiling now, not this map's */
+      /* own max — see below — so an isolated event needs to genuinely get close to  */
+      /* that fixed ceiling by itself to read as "solid," not just relatively close  */
+      /* to whatever the strongest thing elsewhere on the map happens to be).        */
+      const weight = Math.min(0.9, 0.55 + (p.w || 0) * 0.35);
+      const cx = p.x / cellPx + padCells, cy = p.y / cellPx + padCells;
+      const reach = Math.ceil(sigmaCells * 3);
+      const x0 = Math.max(0, Math.floor(cx - reach)), x1 = Math.min(gridW - 1, Math.ceil(cx + reach));
+      const y0 = Math.max(0, Math.floor(cy - reach)), y1 = Math.min(gridH - 1, Math.ceil(cy + reach));
+      const denom = 2 * sigmaCells * sigmaCells;
+      for (let gy = y0; gy <= y1; gy++) {
+        const dy = gy - cy;
+        const rowOff = gy * gridW;
+        for (let gx = x0; gx <= x1; gx++) {
+          const dx = gx - cx;
+          const contribution = weight * Math.exp(-(dx * dx + dy * dy) / denom);
+          const idx = rowOff + gx;
+          if (contribution > grid[idx]) grid[idx] = contribution;
+        }
+      }
+    });
+    /* Many thresholds (not the earlier 8) so bands step in fine enough           */
+    /* increments to read as a smooth continuous gradient rather than visible     */
+    /* rings — this is the "blend more" fix; it's a resolution knob, not a       */
+    /* different technique.                                                      */
+    /* Explicit threshold VALUES, not a bare count: passing a count lets d3      */
+    /* auto-pick "nice" round numbers across [min,max], and since most of this   */
+    /* grid is untouched exact 0 (nothing splatted there), that nice-number      */
+    /* sequence can include 0 itself — a "density >= 0" contour is true          */
+    /* everywhere, so it fills the ENTIRE grid as one solid block. Building the  */
+    /* thresholds ourselves, strictly greater than 0, avoids that entirely.      */
+    let maxVal = 0;
+    for (let i = 0; i < grid.length; i++) if (grid[i] > maxVal) maxVal = grid[i];
+    if (maxVal <= 0) return { contours: [], padCells };
+    /* Threshold spacing is sqrt-scaled (gamma < 1), not linear: a big magnitude   */
+    /* event's peak sets maxVal, and a much weaker/isolated event's own peak might */
+    /* only be a small fraction of that. Evenly-LINEAR thresholds from 0 to maxVal */
+    /* would then cross that weak event's whole range in just 1-2 steps — it reads */
+    /* as a single flat-colored disc with no internal gradient, and its edge just  */
+    /* disappears rather than fading. Packing more thresholds into the low end     */
+    /* gives every event, strong or weak, enough bands to show a real soft falloff */
+    /* — this is the "make them blend and fade" fix.                              */
+    /* Also needs fine resolution at the HIGH end (near t=1) — that's where        */
+    /* densityColor() blends to yellow, and a Gaussian is flattest right at its    */
+    /* own peak, so without enough thresholds there, only one or two huge bands    */
+    /* cover that whole region and yellow ends up covering way more area than      */
+    /* intended. A cosine ease (dense at both ends, sparse in the middle, where    */
+    /* the extra resolution isn't needed) covers both cases with one formula.      */
+    /* Fewer bands, not more: every contour band is a NESTED shape painted over the */
+    /* ones below it, and even a low-alpha band still adds SOME opacity wherever it */
+    /* covers — with dozens of bands all overlapping at any given point, that       */
+    /* stacks into much higher effective opacity than any single band's alpha       */
+    /* value suggests (compositing N thin layers approaches 1-(1-a)^N, not just a). */
+    /* That's what made moderate-density areas stay "bright" despite a steep alpha  */
+    /* curve — more thresholds didn't mean smoother, it meant more compounding.     */
+    const levels = 22;
+    const thresholds = Array.from({ length: levels }, (_, i) => maxVal * (0.5 - 0.5 * Math.cos(Math.PI * (i + 1) / levels)));
+    const cs = d3contours().size([gridW, gridH]).thresholds(thresholds)(grid);
+    return { contours: cs, padCells };
+  }, [pts, w, h]);
+
+  if (!contours.length) return null;
+  const contourPath = geoPath();
+  const uid = `${Math.round(w)}-${Math.round(h)}`;
+  const clipId = `dclip-${uid}`;
+  const maskId = `dmask-${uid}`;
+  const blurId = `dblur-${uid}`;
+  const smoothId = `dsmooth-${uid}`;
+  const padPx = padCells * cellPx;
+  /* Tied to padPx (which itself scales with the largest point's own kernel      */
+  /* radius), not just a fixed fraction of the card — a wide-felt-radius event   */
+  /* near the edge needs a proportionally wider fade zone than the card-size-    */
+  /* only formula gave it, or the vignette's blur doesn't reach far enough to    */
+  /* actually soften that specific crossing.                                    */
+  const fadeWidth = Math.max(24, Math.min(w, h) * 0.1, padPx * 0.6);
+
+  /* No nested <svg> here — a nested SVG's percentage width/height resolves      */
+  /* against an ambient viewport that this browser sizes unpredictably small,    */
+  /* so content drawn inside it can overflow its own box and bleed past the      */
+  /* visible card edge. Bubbles and region paths never hit this because they     */
+  /* draw straight into the shared coordinate space; do the same here.          */
+  /* The hard rect clip alone isn't sufficient: an event genuinely located near  */
+  /* the edge of the country's bounding box (real example — an offshore Japan    */
+  /* Trench earthquake right at Japan's east edge) has a hot CORE that legitimately */
+  /* extends past the visible frame, not just a decayed tail — no amount of KDE  */
+  /* padding fixes that, since the padding only helps the falloff, not the peak. */
+  /* A soft mask that fades opacity to zero within the last ~10% of each edge    */
+  /* turns that unavoidable crossing into a vignette instead of a hard slice —   */
+  /* built the standard way: a blurred black frame-stroke subtracted from a      */
+  /* white field, used as a luminance mask.                                     */
   return (
-    <svg viewBox={`0 0 ${w} ${h}`} style={{ width: "100%", height: "100%", display: "block" }}>
-      <defs><filter id={`dblur-${uid}`} x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation={blur} /></filter></defs>
-      <rect x="0" y="0" width={w} height={h} fill="rgba(255,255,255,0.015)" />
-      <g filter={`url(#dblur-${uid})`} style={{ mixBlendMode: "screen" }}>
-        {pts.map((p, i) => <circle key={i} cx={p.x} cy={p.y} r={minR + (p.w || 0.4) * (maxR - minR)} fill={C.heatHigh} fillOpacity={0.16} />)}
+    <>
+      <defs>
+        <clipPath id={clipId}><rect x="0" y="0" width={w} height={h} /></clipPath>
+        <filter id={blurId} x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation={fadeWidth * 0.4} /></filter>
+        {/* Smooths the blocky/angular polygon edges marching-squares produces at the */}
+        {/* small, coarse-grid contour bands near the hot core (each grid cell here   */}
+        {/* is cellPx=3 real pixels — a tight, few-cell-wide band literally can't      */}
+        {/* trace a smooth circle at that resolution). Cheaper than raising grid       */}
+        {/* resolution, and fixes the actual artifact (jagged polygon edges), not      */}
+        {/* just its symptom.                                                         */}
+        <filter id={smoothId} x="-30%" y="-30%" width="160%" height="160%"><feGaussianBlur stdDeviation="0.6" /></filter>
+        <mask id={maskId} maskUnits="userSpaceOnUse" x="0" y="0" width={w} height={h}>
+          <rect x="0" y="0" width={w} height={h} fill="white" />
+          <rect x="0" y="0" width={w} height={h} fill="none" stroke="black" strokeWidth={fadeWidth} filter={`url(#${blurId})`} />
+        </mask>
+      </defs>
+      <g clipPath={`url(#${clipId})`} mask={`url(#${maskId})`} filter={`url(#${smoothId})`}>
+        <g transform={`translate(${-padPx},${-padPx}) scale(${cellPx})`}>
+          {contours.map((c, i) => {
+            /* Fixed ceiling (1), not this map's own empirical max: dividing by the max */
+            /* VALUE ACTUALLY PRESENT meant a single isolated event got compared to     */
+            /* whatever the strongest thing on the whole map reached — a tight, heavily */
+            /* overlapping cluster elsewhere could inflate that reference so much that   */
+            /* the isolated event, despite being a completely real, legitimate quake,    */
+            /* rounds down to nearly invisible. Grid values are bounded to [0,1] by      */
+            /* construction (max() of per-point weights, each already capped <=0.9), so  */
+            /* comparing against a flat 1 gives every event a consistent, map-independent */
+            /* scale — an isolated event's visibility no longer depends on what else is   */
+            /* on the map.                                                               */
+            const t = Math.min(1, c.value);
+            /* No artificial plateau this time — with max() instead of screen-blend       */
+            /* above, t already reflects a real (steep, not artificially flattened)       */
+            /* Gaussian falloff, so a plain power curve is enough on its own. Slightly     */
+            /* softer than before (4.5, not 6) — a very steep curve fades to near-zero     */
+            /* opacity across most of the visible body, not just the rim, and translucent  */
+            /* red loses most of its contrast blended into a light cream background        */
+            /* (unlike the dark theme, where any nonzero opacity still pops against near-   */
+            /* black). This keeps the hard edge-fade while leaving the body legible.        */
+            const alpha = Math.pow(t, 4.5);
+            return <path key={i} d={contourPath(c)} fill={heatRamp(C, t)} fillOpacity={alpha} stroke="none" />;
+          })}
+        </g>
       </g>
-      <g style={{ mixBlendMode: "screen" }}>
-        {pts.map((p, i) => <circle key={`core-${i}`} cx={p.x} cy={p.y} r={2} fill={C.heatHigh} fillOpacity={0.35} />)}
-      </g>
-    </svg>
+    </>
   );
 }
 
 function hexToRgb(hex) { const m = hex.replace("#", ""); return { r: parseInt(m.substring(0, 2), 16), g: parseInt(m.substring(2, 4), 16), b: parseInt(m.substring(4, 6), 16) }; }
 function withAlpha(hex, a) { const { r, g, b } = hexToRgb(hex); return `rgba(${r},${g},${b},${a})`; }
-function lerpColor(a, b, t) { const pa = hexToRgb(a), pb = hexToRgb(b); return `rgb(${Math.round(pa.r + (pb.r - pa.r) * t)},${Math.round(pa.g + (pb.g - pa.g) * t)},${Math.round(pa.b + (pb.b - pa.b) * t)})`; }
+
+/* Perceptually-uniform sequential scale, built from REAL published colormap    */
+/* data (matplotlib/ParaView), not hand-picked hex values — per Kenneth         */
+/* Moreland's color-advice guidance (kennethmoreland.com/color-advice), which   */
+/* recommends Inferno/Magma/Black Body for 2D data like this over plain         */
+/* Viridis, which it specifically flags as having "not as much discrimination"  */
+/* between levels — the opposite of what a density map needs.                  */
+/* heatLow/Mid/High are anchor points lifted directly from real colormap data — */
+/* Inferno for the crimson theme (purple -> magenta -> red), "hot" (the classic */
+/* black-body ramp Moreland's page itself names) for the atlas theme, truncated */
+/* to ONLY its pure-red segment (t before green activates in hot's definition — */
+/* R ramps 0->1 while G and B stay exactly 0), so it's visually distinct from   */
+/* Inferno at a glance — plain red-only, no purple at all — not just a subtly   */
+/* different anchor pick from the same family. Both truncated to skip their     */
+/* near-black starting anchor (needed some baseline visibility against both     */
+/* backgrounds) and to stop before either curve turns orange/yellow, since red  */
+/* is this app's highest-severity color everywhere else (alertRed, bloodRed)    */
+/* and orange/yellow would read as a step down from that, not up. Interpolated  */
+/* between those anchors in HCL (cylindrical Lab) rather than raw RGB, so equal */
+/* steps in density correspond to equal steps in perceived intensity instead of */
+/* the muddy midpoints a straight RGB lerp produces. Shared by the Regions      */
+/* choropleth and the Density                                                  */
+/* contour surface so both map views read as one consistent color language.    */
+function heatRamp(C, t) {
+  const tc = Math.min(1, Math.max(0, t));
+  const lo = interpolateHcl(C.heatLow, C.heatMid);
+  const hi = interpolateHcl(C.heatMid, C.heatHigh);
+  return tc < 0.5 ? lo(tc / 0.5) : hi((tc - 0.5) / 0.5);
+}
 function heatColor(C, v, max) {
   const t = Math.min(1, v / max);
   if (t === 0) return "rgba(128,128,128,0.06)";
-  if (t < 0.5) return lerpColor(C.heatLow, C.heatMid, t / 0.5);
-  return lerpColor(C.heatMid, C.heatHigh, (t - 0.5) / 0.5);
+  return heatRamp(C, t);
 }
+
 
 /* ---------------------------------------------------------------------- */
 /* Sección de mapa unificada — Epicentros / Densidad / Regiones           */
 /* Usa geoBoundaries en vivo (ADM0 para el contorno, ADM1 para regiones)  */
 /* proyectadas con d3-geo; los límites se piden solo bajo demanda.        */
 /* ---------------------------------------------------------------------- */
-function CountryMapCard({ id, events, mapView }) {
+function CountryMapCard({ id, events, mapView, rowHeight }) {
   const C = React.useContext(ThemeContext);
   const t = React.useContext(LangContext);
   const cfg = COUNTRY_REGISTRY[id];
@@ -390,6 +685,10 @@ function CountryMapCard({ id, events, mapView }) {
   const [adm1, setAdm1] = useState(null);
   const [adm1Status, setAdm1Status] = useState("idle");
   const [popup, setPopup] = useState(null);
+  const [listCollapsed, setListCollapsed] = useState(false);
+  const svgRef = useRef(null);
+  const zoomBehaviorRef = useRef(null);
+  const [transform, setTransform] = useState(zoomIdentity);
 
   useEffect(() => {
     let alive = true;
@@ -410,6 +709,68 @@ function CountryMapCard({ id, events, mapView }) {
 
   const W = cfg.tall ? 300 : 420, H = cfg.tall ? 640 : 340;
 
+  /* Pan/zoom — a swarm/aftershock sequence can pack dozens of epicenters into  */
+  /* a few pixels, making individual events unclickable. Lets the user zoom in */
+  /* to separate them, and slightly out past the default fit too (0.8x-8x)     */
+  /* without touching the underlying geo projection — zoom is a pure view      */
+  /* transform layered on top.                                                */
+  /* translateExtent is deliberately LARGER than the content box (extent) —    */
+  /* if they were equal, d3-zoom would never let panned content pull away from */
+  /* fully covering the viewport, which means an edge/corner feature can never */
+  /* be centered (there's nowhere for the empty space around it to go), and    */
+  /* panning near a boundary "snaps" hard against that wall, which is what     */
+  /* read as janky. The margin here is how far past the content edge you can   */
+  /* drag before hitting the (still-real, just farther out) limit.            */
+  /* A callback ref, not a plain ref + useEffect: this component early-returns */
+  /* a plain loading <div> (no <svg> at all) while adm0Status is "loading", so */
+  /* an effect keyed on [W,H] (which never changes) would fire once during     */
+  /* that loading render — while the ref is still null — and never fire again  */
+  /* once the real <svg> mounts, since its dependencies never change. A        */
+  /* callback ref instead runs exactly when the DOM node itself appears.       */
+  const attachZoom = useCallback((node) => {
+    if (node) {
+      svgRef.current = node;
+      const zb = d3zoom()
+        .scaleExtent([0.8, 8])
+        .extent([[0, 0], [W, H]])
+        .translateExtent([[-W * 0.5, -H * 0.5], [W * 1.5, H * 1.5]])
+        .on("zoom", (event) => setTransform(event.transform));
+      zoomBehaviorRef.current = zb;
+      d3select(node).call(zb);
+    } else if (svgRef.current) {
+      d3select(svgRef.current).on(".zoom", null);
+      svgRef.current = null;
+    }
+  }, [W, H]);
+
+  /* Plain .call(), no .transition(): d3-transition's driver doesn't reliably tick */
+  /* forward in this environment — verified directly, a fresh zoom behavior + a    */
+  /* fresh transition import still never reaches its target transform, while the   */
+  /* exact same call without .transition() applies instantly and correctly every   */
+  /* time. Losing the animated glide is a smaller cost than the buttons/list not   */
+  /* actually working.                                                            */
+  const zoomBy = useCallback((factor) => {
+    if (!svgRef.current || !zoomBehaviorRef.current) return;
+    d3select(svgRef.current).call(zoomBehaviorRef.current.scaleBy, factor);
+  }, []);
+  const zoomReset = useCallback(() => {
+    if (!svgRef.current || !zoomBehaviorRef.current) return;
+    d3select(svgRef.current).call(zoomBehaviorRef.current.transform, zoomIdentity);
+  }, []);
+  /* Centers and zooms the map on a specific event's projected (pre-zoom) x/y —   */
+  /* used by the epicenter list so tapping an entry actually takes you there,     */
+  /* not just to a popup. Builds the target transform directly: solving           */
+  /* "8 + k*px + tx = W/2" (the same formula the popup's own position math uses,  */
+  /* in reverse) for tx, ty at a fixed, comfortably-zoomed-in k.                  */
+  const zoomToEvent = useCallback((p) => {
+    if (!svgRef.current || !zoomBehaviorRef.current) return;
+    const targetK = 4;
+    const tx = W / 2 - 8 - targetK * p.x;
+    const ty = H / 2 - 8 - targetK * p.y;
+    const target = zoomIdentity.translate(tx, ty).scale(targetK);
+    d3select(svgRef.current).call(zoomBehaviorRef.current.transform, target);
+  }, [W, H]);
+
   const projection = useMemo(() => {
     if (!adm0) return null;
     try {
@@ -419,7 +780,13 @@ function CountryMapCard({ id, events, mapView }) {
       /* the mainland (what people actually came to look at) to a sliver. Fit   */
       /* the scale to the largest contiguous polygon instead; the full         */
       /* geometry still gets drawn, just at the mainland's zoom level.         */
-      return geoMercator().fitSize([W - 16, H - 16], mainlandRing(adm0) || adm0);
+      /* fitExtent (not fitSize) with an inset box: fitSize scales the mainland */
+      /* to touch the box edges exactly, so a thin extremity right at the edge */
+      /* (e.g. Chile's southern archipelago) sits flush against the frame with */
+      /* zero margin — easy to misread as clipped/missing. A small inset gives */
+      /* every edge breathing room without changing what's actually rendered.  */
+      const pad = 10;
+      return geoMercator().fitExtent([[pad, pad], [W - 16 - pad, H - 16 - pad]], mainlandRing(adm0) || adm0);
     } catch { return null; }
   }, [adm0, W, H]);
 
@@ -429,18 +796,25 @@ function CountryMapCard({ id, events, mapView }) {
     if (!projection) return [];
     return events.map((e) => {
       const p = projection([e.lon, e.lat]);
-      return p ? { ...e, x: p[0] + 8, y: p[1] + 8 } : null;
+      if (!p) return null;
+      /* Felt-radius in real km, converted to THIS projection's pixels by       */
+      /* actually projecting a point that far away (due east) and measuring    */
+      /* the pixel distance — correct regardless of latitude or which          */
+      /* country's fitted scale is in play.                                    */
+      const edge = projection(destinationPoint(e.lon, e.lat, feltRadiusKm(e.mag), 90));
+      const radiusPx = edge ? Math.hypot(edge[0] - p[0], edge[1] - p[1]) : 20;
+      return { ...e, x: p[0] + 8, y: p[1] + 8, radiusPx };
     }).filter(Boolean);
   }, [projection, events]);
 
   const maxMag = Math.max(1, ...events.map((e) => e.mag));
 
   const regionCounts = useMemo(() => {
-    if (!adm1) return null;
+    if (!adm1 || !path) return null;
     return adm1.features.map((f) => {
-      let count = 0;
-      events.forEach((e) => { if (geoContains(f, [e.lon, e.lat])) count += 1; });
-      return { feature: f, count, d: path ? path(f) : "" };
+      const regionEvents = events.filter((e) => geoContains(f, [e.lon, e.lat]));
+      const c = path.centroid(f);
+      return { feature: f, count: regionEvents.length, events: regionEvents, d: path(f), cx: c[0] + 8, cy: c[1] + 8 };
     });
   }, [adm1, events, path]);
   const maxRegionCount = regionCounts ? Math.max(1, ...regionCounts.map((r) => r.count)) : 1;
@@ -452,50 +826,200 @@ function CountryMapCard({ id, events, mapView }) {
     return <div style={{ height: H * 0.5, display: "flex", alignItems: "center", justifyContent: "center", color: C.textFaint, fontSize: 12.5, textAlign: "center", padding: 20 }}>{t.boundaryError}</div>;
   }
 
+  const k = transform.k;
+
+  const cssHeight = rowHeight || (cfg.tall ? 420 : 300);
+
   return (
     <div style={{ position: "relative" }}>
-      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: cfg.tall ? 420 : 300, background: "rgba(128,128,128,0.04)", borderRadius: 10 }}
+      <div style={{ position: "relative" }}>
+      <svg ref={attachZoom} viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: cssHeight, background: "rgba(128,128,128,0.04)", borderRadius: 10, touchAction: "none", cursor: k > 1.001 ? "grab" : "default" }}
         onClick={() => setPopup((p) => (p && p.pinned ? null : p))}>
         <g transform="translate(8,8)">
-          {mapView === "regions" && regionCounts && regionCounts.map((r, i) => (
-            <path key={i} d={r.d} fill={heatColor(C, r.count, maxRegionCount)} stroke={withAlpha(C.text, 0.15)} strokeWidth={0.5}>
-              <title>{`${r.feature.properties?.shapeName || "?"}: ${r.count}`}</title>
-            </path>
-          ))}
-          {mapView === "regions" && adm1Status === "loading" && (
-            <text x={(W - 16) / 2} y={(H - 16) / 2} textAnchor="middle" fontSize="11" fill={C.textFaint}>{t.loadingBoundary}</text>
-          )}
-          {mapView !== "regions" && path(adm0) && (
-            <path d={path(adm0)} fill="none" stroke={C.text} strokeWidth={1.5} opacity={0.55} />
-          )}
-          {mapView === "bubbles" && projected.map((p, i) => {
-            const r = 2 + (p.mag / maxMag) * 7;
-            return (
-              <circle key={i} cx={p.x} cy={p.y} r={r} fill={C.dotRed} fillOpacity={0.85} stroke={withAlpha(C.bg, 0.6)} strokeWidth={0.6}
-                style={{ cursor: "pointer" }}
-                onMouseEnter={() => { if (!(popup && popup.pinned)) setPopup({ event: p, x: p.x, y: p.y, pinned: false }); }}
-                onMouseLeave={() => setPopup((pp) => (pp && pp.pinned ? pp : null))}
-                onClick={(ev) => { ev.stopPropagation(); setPopup({ event: p, x: p.x, y: p.y, pinned: true }); }} />
-            );
-          })}
-          {mapView === "density" && (
-            <DensityField pts={projected.map((p) => ({ x: p.x, y: p.y, w: p.mag / maxMag }))} w={W - 16} h={H - 16} uid={`${id}-dens`} minR={cfg.tall ? 22 : 14} maxR={cfg.tall ? 42 : 28} blur={cfg.tall ? 12 : 9} />
-          )}
+          <g transform={transform.toString()}>
+            {mapView === "regions" && regionCounts && regionCounts.map((r, i) => {
+              const name = r.feature.properties?.shapeName || "?";
+              const isHovered = popup && popup.kind === "region" && popup.region.name === name;
+              return (
+                <path key={i} d={r.d} fill={heatColor(C, r.count, maxRegionCount)}
+                  stroke={isHovered ? C.text : withAlpha(C.text, 0.15)} strokeWidth={(isHovered ? 1.4 : 0.5) / k}
+                  style={{ cursor: "pointer" }}
+                  onMouseEnter={() => { if (!(popup && popup.pinned)) setPopup({ kind: "region", region: { name, count: r.count, events: r.events }, x: r.cx, y: r.cy, pinned: false }); }}
+                  onMouseLeave={() => setPopup((pp) => (pp && pp.pinned ? pp : null))}
+                  onClick={(ev) => { ev.stopPropagation(); setPopup({ kind: "region", region: { name, count: r.count, events: r.events }, x: r.cx, y: r.cy, pinned: true }); }} />
+              );
+            })}
+            {mapView === "regions" && adm1Status === "loading" && (
+              <text x={(W - 16) / 2} y={(H - 16) / 2} textAnchor="middle" fontSize={11 / k} fill={C.textFaint}>{t.loadingBoundary}</text>
+            )}
+            {mapView !== "regions" && path(adm0) && (
+              <path d={path(adm0)} fill="none" stroke={C.text} strokeWidth={1.5 / k} opacity={0.55} />
+            )}
+            {mapView === "bubbles" && projected.map((p, i) => {
+              const r = (2 + (p.mag / maxMag) * 7) / k;
+              return (
+                <circle key={i} cx={p.x} cy={p.y} r={r} fill={C.dotRed} fillOpacity={0.85} stroke={withAlpha(C.bg, 0.6)} strokeWidth={0.6 / k}
+                  style={{ cursor: "pointer" }}
+                  onMouseEnter={() => setPopup((pp) => (pp && pp.pinned ? pp : { kind: "event", event: p, x: p.x, y: p.y, pinned: false }))}
+                  onMouseLeave={() => setPopup((pp) => (pp && pp.pinned ? pp : null))}
+                  onClick={(ev) => { ev.stopPropagation(); if (p.id) window.open(usgsEventUrl(p.id), "_blank", "noopener,noreferrer"); }} />
+              );
+            })}
+            {mapView === "density" && (
+              <>
+                <DensitySurface pts={projected.map((p) => ({ x: p.x, y: p.y, r: p.radiusPx, w: p.mag / maxMag }))} w={W - 16} h={H - 16} />
+                {/* A weak/isolated event on a large, elongated map (Chile: same physical  */}
+                {/* felt-radius in km projects to fewer pixels than on a compact country's  */}
+                {/* map, since the projection's pixels-per-km ratio is smaller) can render  */}
+                {/* as a barely-visible speck. A subtle pulsing ring — reusing the same     */}
+                {/* "breathe" animation the live-status dot already uses — draws the eye to */}
+                {/* every epicenter regardless of how small its glow computed to be,        */}
+                {/* without permanently enlarging anything (which would clutter a swarm).   */}
+                {/* Yellow hot-core, back to being its own marker AT THE REAL EPICENTER —  */}
+                {/* not derived from the merged density field's peak, which (for a cluster */}
+                {/* of several close events) can sit somewhere between them that isn't any  */}
+                {/* single actual epicenter. Using the exact same p.x/p.y as the pulsar     */}
+                {/* ring guarantees they always line up. Kept deliberately small and         */}
+                {/* magnitude-INSENSITIVE (a tight clamp, not a fraction of felt-radius)     */}
+                {/* so it can't balloon the way the first attempt at a separate marker did.  */}
+                {/* A single flat color can't contrast against both what this marker usually  */}
+                {/* sits on (the glow's own hot-core red, ranging dark to bright) AND the     */}
+                {/* page background for the rare near-invisible-glow case — a themed gold      */}
+                {/* worked against the page bg but nearly vanished against the red it's        */}
+                {/* actually drawn on top of (1.2-1.9:1). White + a thin dark outline is the   */}
+                {/* standard fix for exactly this ("halo" markers on maps): white reads        */}
+                {/* clearly against every red in this app's glow range in both themes, and     */}
+                {/* the outline (the theme's own text color, already designed for bg contrast) */}
+                {/* covers the rare case where there's essentially no glow underneath.         */}
+                <defs>
+                  <radialGradient id={`epicenter-${id}`}>
+                    <stop offset="0%" stopColor="#FF007F" stopOpacity="1" />
+                    <stop offset="45%" stopColor="#FF8000" stopOpacity="0.85" />
+                    <stop offset="100%" stopColor="#FF8000" stopOpacity="0" />
+                  </radialGradient>
+                </defs>
+                {projected.map((p, i) => (
+                  <circle key={`ep-${i}`} cx={p.x} cy={p.y} r={Math.min(3.2, Math.max(1.5, (p.radiusPx || 20) * 0.055))}
+                    fill={`url(#epicenter-${id})`} stroke={C.text} strokeWidth={0.5 / k} strokeOpacity={0.5} />
+                ))}
+                {projected.map((p, i) => (
+                  <circle key={`pulse-${i}`} className="liveDot" cx={p.x} cy={p.y} r={3.5 / k}
+                    fill="none" stroke="#FF007F" strokeWidth={0.9 / k} strokeOpacity={0.6}
+                    style={{ transformBox: "fill-box", transformOrigin: "center" }} />
+                ))}
+              </>
+            )}
+          </g>
         </g>
       </svg>
+      <div style={{ position: "absolute", top: 8, right: 8, display: "flex", flexDirection: "column", alignItems: "center", gap: 4, zIndex: 4 }}>
+        <button onClick={() => zoomBy(1.6)} aria-label={t.zoomIn} title={t.zoomIn} style={zoomBtnStyle(C)}>+</button>
+        <div style={{ fontSize: 9.5, color: C.textFaint, fontFamily: "'JetBrains Mono', monospace" }}>{Math.round(k * 100)}%</div>
+        <button onClick={() => zoomBy(1 / 1.6)} aria-label={t.zoomOut} title={t.zoomOut} style={zoomBtnStyle(C)}>−</button>
+        {k > 1.001 && <button onClick={zoomReset} aria-label={t.zoomReset} title={t.zoomReset} style={zoomBtnStyle(C)}>⟲</button>}
+      </div>
       {popup && (
         <div style={{
-          position: "absolute", left: `${(popup.x / W) * 100}%`, top: `${(popup.y / H) * 100}%`,
-          transform: "translate(-50%, -115%)", background: "#161217", border: "1px solid rgba(255,255,255,0.12)",
-          borderRadius: 10, padding: "10px 12px", minWidth: 190, boxShadow: "0 8px 24px rgba(0,0,0,0.5)", zIndex: 5,
+          position: "absolute",
+          left: `${((8 + transform.applyX(popup.x)) / W) * 100}%`,
+          top: `${((8 + transform.applyY(popup.y)) / H) * 100}%`,
+          transform: "translate(-50%, -115%)", background: C.surface, border: `1px solid ${C.surfaceBorder}`,
+          borderRadius: 10, padding: "10px 12px", minWidth: 190, maxWidth: 260, boxShadow: `0 8px 24px ${C.surfaceShadow}`, zIndex: 5,
           pointerEvents: popup.pinned ? "auto" : "none",
         }}>
-          {popup.pinned && <button onClick={() => setPopup(null)} aria-label="Close" style={{ position: "absolute", top: 4, right: 6, background: "none", border: "none", color: "#9C9591", fontSize: 14, cursor: "pointer", lineHeight: 1 }}>×</button>}
-          <div style={{ fontSize: 12.5, color: "#EDEAE7", fontWeight: 600, paddingRight: 14 }}>{popup.event.place}</div>
-          <div style={{ fontSize: 11.5, color: "#9C9591", marginTop: 4, display: "flex", flexDirection: "column", gap: 2 }}>
-            <span>M <b style={{ color: "#FF6B4C" }}>{popup.event.mag}</b> · {popup.event.depth} km</span>
-            {popup.event.time && <span>{fmtLocalTime(popup.event.time, id, "es")}</span>}
-          </div>
+          {popup.pinned && <button onClick={() => setPopup(null)} aria-label="Close" style={{ position: "absolute", top: 4, right: 6, background: "none", border: "none", color: C.textFaint, fontSize: 14, cursor: "pointer", lineHeight: 1 }}>×</button>}
+          {popup.kind === "region" ? (
+            <>
+              <div style={{ fontSize: 12.5, color: C.text, fontWeight: 600, paddingRight: 14 }}>{popup.region.name}</div>
+              <div style={{ fontSize: 11.5, color: C.textDim, marginTop: 2, marginBottom: popup.pinned && popup.region.events.length ? 6 : 0 }}>{t.regionEventsCount(popup.region.count)}</div>
+              {popup.pinned && popup.region.events.length > 0 && (
+                <div style={{ maxHeight: 170, overflowY: "auto", display: "flex", flexDirection: "column", gap: 7, borderTop: `1px solid ${C.surfaceBorder}`, paddingTop: 6 }}>
+                  {popup.region.events.map((e) => (
+                    <a key={e.id} href={usgsEventUrl(e.id)} target="_blank" rel="noopener noreferrer"
+                      style={{ display: "block", textDecoration: "none", color: "inherit" }}>
+                      <div style={{ fontSize: 11, color: C.text }}>{e.place}</div>
+                      <div style={{ fontSize: 10.5, color: C.textDim }}>
+                        M <b style={{ color: C.dotRed }}>{e.mag}</b> · {e.depth} km{e.time ? ` · ${fmtLocalTime(e.time, id, "es")}` : ""}
+                      </div>
+                    </a>
+                  ))}
+                </div>
+              )}
+            </>
+          ) : (
+            <>
+              <div style={{ fontSize: 12.5, color: C.text, fontWeight: 600, paddingRight: 14 }}>{popup.event.place}</div>
+              <div style={{ fontSize: 11.5, color: C.textDim, marginTop: 4, display: "flex", flexDirection: "column", gap: 2 }}>
+                <span>M <b style={{ color: C.dotRed }}>{popup.event.mag}</b> · {popup.event.depth} km</span>
+                {popup.event.time && <span>{fmtLocalTime(popup.event.time, id, "es")}</span>}
+              </div>
+              {popup.event.id && (
+                <div style={{ marginTop: 6, paddingTop: 6, borderTop: `1px solid ${C.surfaceBorder}` }}>
+                  <div style={{ fontSize: 10, color: C.textFaint, marginBottom: 2 }}>{t.clickEventForReport}</div>
+                  <a href={usgsEventUrl(popup.event.id)} target="_blank" rel="noopener noreferrer"
+                    style={{ display: "block", fontSize: 11, color: C.dotRed, textDecoration: "none" }}>{t.viewOnUsgs}</a>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+      {mapView === "density" && (
+        <div style={{
+          position: "absolute", left: 8, bottom: 8, width: 200,
+          display: "flex", flexDirection: "column", background: C.surface, border: `1px solid ${C.surfaceBorder}`,
+          borderRadius: 10, boxShadow: `0 8px 24px ${C.surfaceShadow}`, zIndex: 4, overflow: "hidden",
+        }}>
+          <button onClick={() => setListCollapsed((v) => !v)}
+            aria-label={listCollapsed ? t.epicenterListExpand : t.epicenterListCollapse}
+            style={{
+              display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%",
+              padding: "8px 10px", background: "none", border: "none", cursor: "pointer", textAlign: "left",
+            }}>
+            <span style={{ fontSize: 10, fontWeight: 600, letterSpacing: 0.4, textTransform: "uppercase", color: C.textDim }}>
+              {t.epicenterListTitle} · {projected.length}
+            </span>
+            <span style={{ color: C.textFaint, fontSize: 16, lineHeight: 1 }}>{listCollapsed ? "▸" : "▾"}</span>
+          </button>
+          {!listCollapsed && (
+            projected.length > 0 ? (
+              <>
+                <div style={{ fontSize: 9, color: C.textFaint, padding: "0 10px 5px" }}>{t.epicenterListHint}</div>
+                <div style={{ height: 130, overflowY: "auto", padding: "0 6px 8px", display: "flex", flexDirection: "column", gap: 1 }}>
+                  {projected.map((p, i) => (
+                    <button key={p.id || i} onClick={() => zoomToEvent(p)}
+                      style={{ display: "block", textAlign: "left", background: "none", border: "none", cursor: "pointer", borderRadius: 6, padding: "5px 4px", width: "100%" }}
+                      onMouseEnter={(ev) => { ev.currentTarget.style.background = withAlpha(C.text, 0.06); }}
+                      onMouseLeave={(ev) => { ev.currentTarget.style.background = "transparent"; }}>
+                      <div style={{ fontSize: 10.5, color: C.text, lineHeight: 1.3 }}>{p.place}</div>
+                      <div style={{ fontSize: 9.5, color: C.textDim }}>
+                        M <b style={{ color: C.dotRed }}>{p.mag}</b>{p.time ? ` · ${fmtLocalTime(p.time, id, "es")}` : ""}
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <div style={{ fontSize: 10.5, color: C.textFaint, padding: "0 10px 12px" }}>{t.epicenterListEmpty}</div>
+            )
+          )}
+        </div>
+      )}
+      </div>
+      {mapView === "regions" && regionCounts && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8, fontSize: 11, color: C.textDim }}>
+          <span>{t.regionLegendLabel}</span>
+          <span>0</span>
+          <div style={{ flex: 1, maxWidth: 140, height: 8, borderRadius: 4, background: `linear-gradient(90deg, ${C.heatLow}, ${C.heatMid}, ${C.heatHigh})` }} />
+          <span>{maxRegionCount}</span>
+        </div>
+      )}
+      {mapView === "density" && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8, fontSize: 11, color: C.textDim }}>
+          <span>{t.densityLegendLabel}</span>
+          <span>{t.densityLegendLow}</span>
+          <div style={{ flex: 1, maxWidth: 140, height: 8, borderRadius: 4, background: `linear-gradient(90deg, ${C.heatLow}, ${C.heatMid}, ${C.heatHigh})` }} />
+          <span>{t.densityLegendHigh}</span>
         </div>
       )}
     </div>
@@ -522,9 +1046,9 @@ function CountryPicker({ active, focus, colorFor, onToggleFocus, onRemove, onAdd
             fontFamily: "'Inter', sans-serif", fontSize: 12.5, color: focus === id ? C.text : C.textDim,
           }}>
           <span style={{ width: 8, height: 8, borderRadius: "50%", background: colorFor(id) }} />
-          {COUNTRY_REGISTRY[id].label}
+          {countryLabel(id, t.lang)}
           {active.length > 1 && (
-            <span onClick={(ev) => { ev.stopPropagation(); onRemove(id); }} aria-label={t.removeCountry(COUNTRY_REGISTRY[id].label)}
+            <span onClick={(ev) => { ev.stopPropagation(); onRemove(id); }} aria-label={t.removeCountry(countryLabel(id, t.lang))}
               style={{ marginLeft: 2, color: C.textFaint, fontSize: 13, lineHeight: 1, padding: "0 2px" }}>×</span>
           )}
         </button>
@@ -545,7 +1069,7 @@ function CountryPicker({ active, focus, colorFor, onToggleFocus, onRemove, onAdd
                 style={{ display: "block", width: "100%", textAlign: "left", padding: "7px 10px", borderRadius: 8, border: "none", background: "transparent", color: "#EDEAE7", fontSize: 12.5, cursor: "pointer" }}
                 onMouseEnter={(e) => (e.currentTarget.style.background = "rgba(255,255,255,0.06)")}
                 onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
-                {COUNTRY_REGISTRY[id].label}
+                {countryLabel(id, t.lang)}
               </button>
             ))}
           </div>
@@ -574,7 +1098,8 @@ export default function App() {
   const mode = override || systemMode;
   const themeId = mode === "light" ? "atlas" : "crimson";
   const C = THEMES[themeId];
-  const tooltipStyle = getTooltipStyle();
+  const tooltipStyle = getTooltipStyle(C);
+  const tooltipItemStyle = { color: C.text };
   const ALERT_COLOR = { green: C.alertGreen, yellow: C.alertYellow, orange: C.alertOrange, red: C.alertRed, none: C.alertNone };
   const ALERT_LABEL = { green: t.alertGreen, yellow: t.alertYellow, orange: t.alertOrange, red: t.alertRed, none: t.alertNone };
   const RANGE_LABEL = { day: t.rangeDay, week: t.rangeWeek, month: t.rangeMonth, year: t.rangeYear };
@@ -604,10 +1129,10 @@ export default function App() {
       setData((d) => ({ ...d, [id]: events }));
       setStatus((s) => ({ ...s, [id]: "live" }));
     } catch (e) {
-      setData((d) => ({ ...d, [id]: generateFallback(id) }));
+      setData((d) => ({ ...d, [id]: generateFallback(id, lang) }));
       setStatus((s) => ({ ...s, [id]: "fallback" }));
     }
-  }, []);
+  }, [lang]);
 
   useEffect(() => { DEFAULT_ACTIVE.forEach(load); setUpdatedAt(new Date()); }, [load]);
 
@@ -617,6 +1142,12 @@ export default function App() {
   const handleRemove = (id) => { setActiveCountries((a) => a.filter((x) => x !== id)); if (focus === id) setFocus(null); if (magTab === id) setMagTab(null); };
   const handleToggleFocus = (id) => setFocus((f) => (f === id ? null : id));
   const visibleCountries = focus ? [focus] : activeCountries;
+  /* When a "tall" country (Chile) shares the map grid row with a default-      */
+  /* height one (Spain), CSS Grid stretches the shorter country's CARD to match */
+  /* the row anyway — but its <svg> used to stay at its own fixed height,       */
+  /* leaving that extra stretched space empty below the map. Sizing every map   */
+  /* in the row to the tallest active country's height puts that space to use.  */
+  const mapRowHeight = Math.max(...visibleCountries.map((id) => (COUNTRY_REGISTRY[id].tall ? 420 : 300)));
 
   useEffect(() => { if (!visibleCountries.includes(magTab) && magTab !== "comparacion") setMagTab(visibleCountries[0]); }, [visibleCountries.join(","), magTab]);
 
@@ -678,7 +1209,7 @@ export default function App() {
   const gridClass = visibleCountries.length >= 3 ? "grid3" : visibleCountries.length === 2 ? "grid2" : "";
   const overallStatus = activeCountries.every((id) => status[id] === "live") ? "live"
     : activeCountries.some((id) => status[id] === "loading" || !status[id]) ? "loading" : "fallback";
-  const titleLabels = visibleCountries.map((id) => COUNTRY_REGISTRY[id].label);
+  const titleLabels = visibleCountries.map((id) => countryLabel(id, lang));
 
   return (
     <ThemeContext.Provider value={C}>
@@ -691,6 +1222,7 @@ export default function App() {
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
         * { box-sizing: border-box; }
+        html, body { margin: 0; background: ${C.bg}; }
         ::selection { background: ${C.bloodRed}; color: #fff; }
         .grid2 { display: grid; grid-template-columns: 1fr; gap: 18px; }
         @media (min-width: 900px) { .grid2 { grid-template-columns: 1fr 1fr; } }
@@ -746,7 +1278,7 @@ export default function App() {
             <CountryPicker active={activeCountries} focus={focus} colorFor={colorFor} onToggleFocus={handleToggleFocus} onRemove={handleRemove} onAdd={handleAdd} />
             {focus && (
               <div style={{ fontSize: 11.5, color: C.textFaint }}>
-                {t.focusNote()}<b style={{ color: colorFor(focus) }}>{COUNTRY_REGISTRY[focus].label}</b>{t.focusNoteEnd}
+                {t.focusNote()}<b style={{ color: colorFor(focus) }}>{countryLabel(focus, lang)}</b>{t.focusNoteEnd}
               </div>
             )}
           </div>
@@ -760,7 +1292,7 @@ export default function App() {
                 const s = summary(id);
                 return (
                   <div key={id} className="glassHover" style={getGlassCard(C)}>
-                    <h3 style={{ margin: "0 0 10px", fontFamily: "'Chakra Petch', sans-serif", color: colorFor(id), fontSize: 15, textTransform: "uppercase", letterSpacing: 0.5 }}>{COUNTRY_REGISTRY[id].label} · {RANGE_LABEL[range]}</h3>
+                    <h3 style={{ margin: "0 0 10px", fontFamily: "'Chakra Petch', sans-serif", color: colorFor(id), fontSize: 15, textTransform: "uppercase", letterSpacing: 0.5 }}>{countryLabel(id, lang)} · {RANGE_LABEL[range]}</h3>
                     <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
                       <StatChip label={t.statEvents} value={s.total} />
                       <StatChip label={t.statMaxMag} value={s.max} accent={C.bloodRed} />
@@ -782,8 +1314,8 @@ export default function App() {
               <div className={gridClass || undefined}>
                 {visibleCountries.map((id) => (
                   <div key={id}>
-                    <div style={{ fontSize: 11.5, color: colorFor(id), fontFamily: "'JetBrains Mono', monospace", marginBottom: 6 }}>{COUNTRY_REGISTRY[id].label}</div>
-                    <CountryMapCard id={id} events={filtered[id] || []} mapView={mapView} />
+                    <div style={{ fontSize: 11.5, color: colorFor(id), fontFamily: "'JetBrains Mono', monospace", marginBottom: 6 }}>{countryLabel(id, lang)}</div>
+                    <CountryMapCard id={id} events={filtered[id] || []} mapView={mapView} rowHeight={mapRowHeight} />
                   </div>
                 ))}
               </div>
@@ -795,13 +1327,13 @@ export default function App() {
               <>
                 <div className={gridClass || undefined}>
                   {visibleCountries.map((id) => (
-                    <ChartCard key={id} title={`${t.magTimeTitle} — ${COUNTRY_REGISTRY[id].label}`} subtitle={t.magTimeSubtitleDesktop}>
+                    <ChartCard key={id} title={`${t.magTimeTitle} — ${countryLabel(id, lang)}`} subtitle={t.magTimeSubtitleDesktop}>
                       <ResponsiveContainer width="100%" height={240}>
                         <LineChart data={lineData(id)} margin={{ top: 4, right: 10, left: -18, bottom: 0 }}>
                           <CartesianGrid stroke={C.grid} vertical={false} />
                           <XAxis dataKey="x" type="number" domain={["dataMin", "dataMax"]} tickFormatter={(v) => fmtAxisTime(v, granularity, lang)} stroke={C.textFaint} fontSize={11} />
                           <YAxis domain={[0, "dataMax + 1"]} stroke={C.textFaint} fontSize={11} />
-                          <Tooltip contentStyle={tooltipStyle} labelFormatter={(v) => fmtLocalTime(v, id, lang)} formatter={(v) => [v, t.magAxis]} />
+                          <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} labelFormatter={(v) => fmtLocalTime(v, id, lang)} formatter={(v) => [v, t.magAxis]} />
                           <Line type="monotone" dataKey="mag" stroke={colorFor(id)} strokeWidth={2.8} dot={false} isAnimationActive={false} />
                         </LineChart>
                       </ResponsiveContainer>
@@ -821,8 +1353,8 @@ export default function App() {
                         <CartesianGrid stroke={C.grid} vertical={false} />
                         <XAxis dataKey="x" type="number" domain={["dataMin", "dataMax"]} tickFormatter={(v) => fmtAxisTime(v, granularity, lang)} stroke={C.textFaint} fontSize={11} />
                         <YAxis stroke={C.textFaint} fontSize={11} />
-                        <Tooltip contentStyle={tooltipStyle} labelFormatter={(v) => fmtAxisTime(v, granularity, lang)} />
-                        <Legend wrapperStyle={{ fontSize: 12 }} formatter={(v) => COUNTRY_REGISTRY[v]?.label || v} />
+                        <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} labelFormatter={(v) => fmtAxisTime(v, granularity, lang)} />
+                        <Legend wrapperStyle={{ fontSize: 12 }} formatter={(v) => countryLabel(v, lang) || v} />
                         {visibleCountries.map((id) => <Area key={id} type="monotone" dataKey={id} stroke={colorFor(id)} strokeWidth={2.5} fill={`url(#gradD-${id})`} isAnimationActive={false} />)}
                       </AreaChart>
                     </ResponsiveContainer>
@@ -832,7 +1364,7 @@ export default function App() {
             ) : (
               <ChartCard title={t.magTimeTitle} subtitle={t.magTimeSubtitleMobile} wide>
                 <div style={{ marginBottom: 12 }}>
-                  <SegmentedControl options={[...visibleCountries.map((id) => [id, COUNTRY_REGISTRY[id].label]), ...(visibleCountries.length > 1 ? [["comparacion", t.comparacion]] : [])]} value={magTab || visibleCountries[0]} onChange={setMagTab} />
+                  <SegmentedControl options={[...visibleCountries.map((id) => [id, countryLabel(id, lang)]), ...(visibleCountries.length > 1 ? [["comparacion", t.comparacion]] : [])]} value={magTab || visibleCountries[0]} onChange={setMagTab} />
                 </div>
                 <div className="fadeIn" key={magTab}>
                   {magTab !== "comparacion" ? (
@@ -841,7 +1373,7 @@ export default function App() {
                         <CartesianGrid stroke={C.grid} vertical={false} />
                         <XAxis dataKey="x" type="number" domain={["dataMin", "dataMax"]} tickFormatter={(v) => fmtAxisTime(v, granularity, lang)} stroke={C.textFaint} fontSize={11} />
                         <YAxis domain={[0, "dataMax + 1"]} stroke={C.textFaint} fontSize={11} />
-                        <Tooltip contentStyle={tooltipStyle} labelFormatter={(v) => fmtLocalTime(v, magTab || visibleCountries[0], lang)} formatter={(v) => [v, t.magAxis]} />
+                        <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} labelFormatter={(v) => fmtLocalTime(v, magTab || visibleCountries[0], lang)} formatter={(v) => [v, t.magAxis]} />
                         <Line type="monotone" dataKey="mag" stroke={colorFor(magTab || visibleCountries[0])} strokeWidth={2.8} dot={false} isAnimationActive={false} />
                       </LineChart>
                     </ResponsiveContainer>
@@ -857,8 +1389,8 @@ export default function App() {
                         <CartesianGrid stroke={C.grid} vertical={false} />
                         <XAxis dataKey="x" type="number" domain={["dataMin", "dataMax"]} tickFormatter={(v) => fmtAxisTime(v, granularity, lang)} stroke={C.textFaint} fontSize={11} />
                         <YAxis stroke={C.textFaint} fontSize={11} />
-                        <Tooltip contentStyle={tooltipStyle} labelFormatter={(v) => fmtAxisTime(v, granularity, lang)} />
-                        <Legend wrapperStyle={{ fontSize: 12 }} formatter={(v) => COUNTRY_REGISTRY[v]?.label || v} />
+                        <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} labelFormatter={(v) => fmtAxisTime(v, granularity, lang)} />
+                        <Legend wrapperStyle={{ fontSize: 12 }} formatter={(v) => countryLabel(v, lang) || v} />
                         {visibleCountries.map((id) => <Area key={id} type="monotone" dataKey={id} stroke={colorFor(id)} strokeWidth={2.5} fill={`url(#gradM-${id})`} isAnimationActive={false} />)}
                       </AreaChart>
                     </ResponsiveContainer>
@@ -873,8 +1405,8 @@ export default function App() {
                   <CartesianGrid stroke={C.grid} vertical={false} />
                   <XAxis dataKey="x" type="number" domain={["dataMin", "dataMax"]} tickFormatter={(v) => fmtAxisTime(v, granularity, lang)} stroke={C.textFaint} fontSize={11} />
                   <YAxis stroke={C.textFaint} fontSize={11} />
-                  <Tooltip contentStyle={tooltipStyle} labelFormatter={(v) => fmtAxisTime(v, granularity, lang)} />
-                  <Legend wrapperStyle={{ fontSize: 12 }} formatter={(v) => COUNTRY_REGISTRY[v]?.label || v} />
+                  <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} labelFormatter={(v) => fmtAxisTime(v, granularity, lang)} />
+                  <Legend wrapperStyle={{ fontSize: 12 }} formatter={(v) => countryLabel(v, lang) || v} />
                   {visibleCountries.map((id) => <Line key={id} type="stepAfter" dataKey={id} stroke={colorFor(id)} strokeWidth={2.8} dot={false} isAnimationActive={false} />)}
                 </LineChart>
               </ResponsiveContainer>
@@ -888,8 +1420,8 @@ export default function App() {
                   <CartesianGrid stroke={C.grid} vertical={false} />
                   <XAxis dataKey="bin" stroke={C.textFaint} fontSize={11} />
                   <YAxis stroke={C.textFaint} fontSize={11} />
-                  <Tooltip contentStyle={tooltipStyle} />
-                  <Legend wrapperStyle={{ fontSize: 12 }} formatter={(v) => COUNTRY_REGISTRY[v]?.label || v} />
+                  <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} />
+                  <Legend wrapperStyle={{ fontSize: 12 }} formatter={(v) => countryLabel(v, lang) || v} />
                   {visibleCountries.map((id) => <Bar key={id} dataKey={id} fill={colorFor(id)} radius={[4, 4, 0, 0]} isAnimationActive={false} />)}
                 </BarChart>
               </ResponsiveContainer>
@@ -897,14 +1429,14 @@ export default function App() {
 
             <div className={gridClass || undefined}>
               {visibleCountries.map((id) => (
-                <ChartCard key={id} title={`${t.depthTitle} ${COUNTRY_REGISTRY[id].label}`} subtitle={t.depthSubtitle}>
+                <ChartCard key={id} title={`${t.depthTitle} ${countryLabel(id, lang)}`} subtitle={t.depthSubtitle}>
                   <ResponsiveContainer width="100%" height={240}>
                     <ScatterChart margin={{ top: 4, right: 10, left: -18, bottom: 0 }}>
                       <CartesianGrid stroke={C.grid} />
                       <XAxis dataKey="depth" name={t.depthAxis} unit=" km" stroke={C.textFaint} fontSize={11} />
                       <YAxis dataKey="mag" name={t.magAxis} stroke={C.textFaint} fontSize={11} />
                       <ZAxis range={[30, 30]} />
-                      <Tooltip contentStyle={tooltipStyle} cursor={{ stroke: C.textFaint }} formatter={(v, n) => [v, n === "depth" ? `${t.depthAxis} (km)` : t.magAxis]} />
+                      <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} cursor={{ stroke: C.textFaint }} formatter={(v, n) => [v, n === "depth" ? `${t.depthAxis} (km)` : t.magAxis]} />
                       <Scatter data={depthScatter(id)} isAnimationActive={false}>
                         {depthScatter(id).map((e, i) => <Cell key={i} fill={ALERT_COLOR[e.alert]} fillOpacity={0.85} />)}
                       </Scatter>
@@ -921,7 +1453,7 @@ export default function App() {
 
             <div className={gridClass || undefined}>
               {visibleCountries.map((id) => (
-                <ChartCard key={id} title={`${t.alertTitle} ${COUNTRY_REGISTRY[id].label}`} subtitle={t.alertSubtitle}>
+                <ChartCard key={id} title={`${t.alertTitle} ${countryLabel(id, lang)}`} subtitle={t.alertSubtitle}>
                   <ResponsiveContainer width="100%" height={220}>
                     <PieChart>
                       <Pie data={alertBreakdown(id)} dataKey="value" nameKey="name" innerRadius={52} outerRadius={80} paddingAngle={2} isAnimationActive={false}>
