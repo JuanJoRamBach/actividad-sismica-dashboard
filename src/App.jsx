@@ -241,7 +241,38 @@ function fixShapeNames(gj) {
   return gj;
 }
 
+/* Country/region borders essentially never change, and GitHub's unauthenticated  */
+/* API is rate-limited per CALLING IP across ALL of api.github.com — not per-app  */
+/* — so every uncached fetch here spends a slice of a real visitor's shared quota */
+/* on something that didn't need to change. Cache the fully-processed result     */
+/* (post fixRingWinding/fixShapeNames) in localStorage indefinitely; no TTL, since*/
+/* guessing a "correct" expiry is worse than just bumping BOUNDARY_CACHE_VERSION  */
+/* by hand if the fetch/fix pipeline itself ever changes and old cached entries   */
+/* need invalidating. Failure to read/write the cache is never fatal — it's a     */
+/* nice-to-have, not a requirement, so every localStorage call is wrapped.        */
+const BOUNDARY_CACHE_VERSION = 1;
+const boundaryCacheKey = (iso3, level) => `boundary-cache-v${BOUNDARY_CACHE_VERSION}-${iso3}-${level}`;
+
+function readBoundaryCache(iso3, level) {
+  try {
+    const raw = localStorage.getItem(boundaryCacheKey(iso3, level));
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeBoundaryCache(iso3, level, gj) {
+  try {
+    localStorage.setItem(boundaryCacheKey(iso3, level), JSON.stringify(gj));
+  } catch {
+    /* localStorage full, disabled, or unavailable (private browsing) — ignore. */
+  }
+}
+
 async function fetchBoundary(iso3, level) {
+  const cached = readBoundaryCache(iso3, level);
+  if (cached) return cached;
   const metaRes = await fetch(`https://www.geoboundaries.org/api/current/gbOpen/${iso3}/${level}/`);
   if (!metaRes.ok) throw new Error("meta");
   const meta = await metaRes.json();
@@ -258,7 +289,9 @@ async function fetchBoundary(iso3, level) {
   const geomRes = await fetch(finalUrl);
   if (!geomRes.ok) throw new Error("geom");
   const gj = await geomRes.json();
-  return fixRingWinding(fixShapeNames(gj));
+  const fixed = fixRingWinding(fixShapeNames(gj));
+  writeBoundaryCache(iso3, level, fixed);
+  return fixed;
 }
 
 /* geoBoundaries' ADM0 files ship with every disjoint ring (mainland, each island)  */
@@ -841,7 +874,7 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
               const isHovered = popup && popup.kind === "region" && popup.region.name === name;
               return (
                 <path key={i} d={r.d} fill={regionColor(C, r.count, maxRegionCount)}
-                  stroke={isHovered ? C.text : withAlpha(C.text, 0.5)} strokeWidth={(isHovered ? 1.6 : 0.9) / k}
+                  stroke={isHovered ? C.text : withAlpha(C.text, 0.15)} strokeWidth={(isHovered ? 1.4 : 0.5) / k}
                   style={{ cursor: "pointer" }}
                   onMouseEnter={() => { if (!(popup && popup.pinned)) setPopup({ kind: "region", region: { name, count: r.count, events: r.events }, x: r.cx, y: r.cy, pinned: false }); }}
                   onMouseLeave={() => setPopup((pp) => (pp && pp.pinned ? pp : null))}
