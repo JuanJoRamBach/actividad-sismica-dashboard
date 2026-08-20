@@ -508,10 +508,39 @@ function AlertTooltip({ active, payload }) {
 /* from scratch every single time, even with unchanged events. That's the real  */
 /* cause of the "Density tab freezes on switch" symptom — regionCounts doesn't  */
 /* have this problem because it already lives in CountryMapCard directly.       */
+/* Pre-clusters events close enough their Gaussians would heavily overlap anyway  */
+/* under the max()-combine rule below — a tight swarm of many small events        */
+/* (aftershock sequences are exactly this) otherwise costs one full splat per      */
+/* individual point even though max() means their combined contribution is        */
+/* visually near-identical to just the strongest one among them once they         */
+/* overlap that much. Binning to a small FIXED grid (independent of the main      */
+/* density grid, and not scaled per point) only merges points that are genuinely  */
+/* close in screen space — an isolated/large event rarely shares a bin with       */
+/* anything and comes through untouched. This cuts computational point count      */
+/* roughly in proportion to how clustered the real data is, without dropping a    */
+/* single real event from the underlying data: bubbles/lists elsewhere still show */
+/* every individual event, only this internal density-estimation step simplifies. */
+function clusterDensityPoints(pts) {
+  const binPx = 6;
+  const bins = new Map();
+  pts.forEach((p) => {
+    const key = `${Math.round(p.x / binPx)},${Math.round(p.y / binPx)}`;
+    const existing = bins.get(key);
+    if (!existing) { bins.set(key, { x: p.x, y: p.y, r: p.r, w: p.w, n: 1, sx: p.x, sy: p.y }); return; }
+    existing.n += 1;
+    existing.sx += p.x; existing.sy += p.y;
+    existing.x = existing.sx / existing.n; existing.y = existing.sy / existing.n;
+    existing.r = Math.max(existing.r, p.r);
+    existing.w = Math.max(existing.w, p.w);
+  });
+  return Array.from(bins.values());
+}
+
 const DENSITY_CELL_PX = 3;
-function computeDensityContours(pts, w, h) {
+function computeDensityContours(rawPts, w, h) {
   const cellPx = DENSITY_CELL_PX;
-  if (pts.length < 1) return { contours: [], padCells: 0 };
+  if (rawPts.length < 1) return { contours: [], padCells: 0 };
+  const pts = clusterDensityPoints(rawPts);
   const maxR = Math.max(20, ...pts.map((p) => p.r || 20));
     /* Same reasoning as before: pad past any single point's own kernel reach so */
     /* it fades near-zero before the true edge, instead of getting hard-cut.     */
