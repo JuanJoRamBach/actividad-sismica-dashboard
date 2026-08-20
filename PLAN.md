@@ -211,6 +211,108 @@ Chile's single event (this test period) correctly renders nothing when
 there's only 1 point on the whole map — not a bug, a KDE needs ≥2 points to
 produce a meaningful surface.
 
+### Follow-on UI added after the palette was finalized (also DONE)
+
+Once the color/technique settled, the user asked for three more pieces,
+all shipped and committed (`1b5ba2a`):
+
+- **Theme-aware legend** below the map (density tab only): "{label} [Baja/Low]
+  [gradient bar heatLow→heatMid→heatHigh] [Alta/High]" — new i18n keys
+  `densityLegendLabel/Low/High` in `es`/`en`.
+- **Epicenter list panel** (bottom-left, over the map, density tab only):
+  fixed 200px width, 130px scrollable list, collapsible via a full-width
+  clickable header button (`listCollapsed` state). Clicking an entry calls
+  `zoomToEvent(p)` to pan/zoom the map to that event rather than opening a
+  detail popup (per explicit correction from an earlier version that opened
+  a USGS-link popup instead — user wanted map-centering, not a popup).
+  New i18n keys `epicenterListTitle/Hint/Collapse/Expand/Empty`.
+- **Real d3-zoom bug found and fixed**: `.transition().duration(x).call(zoomBehaviorRef.current.transform, target)`
+  silently no-ops in this environment — confirmed via fresh-module console
+  testing (bypassing the app's bundle) that the exact same `.call()` without
+  `.transition()` applies instantly and correctly. `zoomBy`, `zoomReset`, and
+  the new `zoomToEvent` all use plain `.call()` now — no animated glide, but
+  actually functional.
+- **Layout bug fixed**: the epicenter list panel's `position: absolute;
+  bottom: 8` was anchoring to a container that also included the
+  normal-flow legend sitting below the `<svg>`, so the panel sat higher
+  than intended (misaligned relative to the map's own bottom edge). Fixed
+  by wrapping the `<svg>` + its absolute-positioned children (zoom controls,
+  popup, epicenter list) in their own inner `position: relative` div,
+  separate from the legend, which now renders as a sibling after it.
+- **Atlas (day) theme legend read backwards** — its `heatLow→heatHigh` ramp
+  went dark→light, same direction as the crimson (dark) theme. A dark→light
+  ramp reads correctly as weak→strong against crimson's near-black
+  background, but backwards against atlas's light cream background (the
+  darkest end reads as the strongest, regardless of where it sits in the
+  ramp). Fixed by inverting atlas's ramp to pale→dark instead:
+  `heatLow: "#C9A6E8"` (WCAG 1.76:1 vs bg — intentionally subtle) →
+  `heatMid: "#8B3DC9"` (4.93:1) → `heatHigh: "#3B0066"` (12.92:1) —
+  monotonically increasing contrast now matches the low→high labels.
+- Also fixed in the same commit: `StatChip` (Period Summary cards) had
+  inconsistent title/value vertical alignment depending on whether the
+  label wrapped to 1 or 2 lines — added `minHeight: 28` + flex alignment to
+  reserve consistent label space.
+
+### Post-ship fixes (found after committing `1b5ba2a`, now in `main`)
+
+Two real problems surfaced once the feature was live and got a second look
+against real screenshots — worth recording precisely since both are the
+kind of mistake that's easy to reintroduce.
+
+**Bug: Density and Regions silently shared one palette.** `heatLow/Mid/
+High` was one token set read by *both* the Density surface and the Regions
+choropleth. Landing the Density palette meant overwriting those same three
+keys — which reskinned Regions too, without anyone asking for that. Fixed
+by splitting into fully independent token sets: `regionLow/Mid/High`
+(restored to the original pre-session red/pink and brown/gold values) and
+`densityLow/Mid/High` (Density's own palette). Same problem existed for
+the epicenter marker color, which was typed as a literal hex string in
+three separate JSX spots instead of a token — replaced with
+`epicenterCore`/`epicenterEdge` per theme. **Lesson: shared tokens across
+two visually-independent features are a trap — give each feature its own
+names even when the values start out equal.**
+
+**User preference: night theme reverted to the pre-Density-rework look.**
+After seeing it live, the user preferred the *original* red → crimson →
+hot-pink glow with a flat/glowing gold epicenter dot over the violet/
+magenta palette — specifically for the **crimson (night) theme only**.
+Atlas (day) keeps the violet/magenta-orange palette from the six-round
+session; **don't apply this reversion to atlas too** — an early attempt at
+this fix mistakenly reverted both themes symmetrically, which was wrong
+and had to be undone. Current state:
+- crimson: `densityLow/Mid/High = #3A0A0A/#B2231F/#FF1F8F` (dark red →
+  crimson → hot pink, restored from the original pre-session `heatLow/
+  Mid/High`), `epicenterCore = epicenterEdge = #FFD200` (single-hue gold).
+- atlas: `densityLow/Mid/High = #C9A6E8/#8B3DC9/#3B0066` (the six-round
+  violet palette, contrast-corrected pale→dark direction), `epicenterCore
+  = #FF007F`, `epicenterEdge = #FF8000` (the original two-tone magenta-
+  to-orange marker).
+
+Two real implementation bugs came out of chasing this, both worth keeping
+in mind before touching marker rendering again:
+- **Epicenter marker radius must NOT be divided by the zoom level `k`.**
+  The pulse ring intentionally divides by `k` to stay a constant on-screen
+  size regardless of zoom. The marker dot does the opposite on purpose —
+  it should grow somewhat as you zoom in, using a small base radius clamp
+  (`Math.min(3.2, Math.max(1.5, radiusPx * 0.055))`, no `/k`) rather than
+  a fixed on-screen size. Dividing it by `k` (an earlier attempt at fixing
+  overlap) made dots stay tiny at high zoom instead of growing — wrong
+  direction.
+- **A flat, fully-opaque marker fill fuses into a hard blob when several
+  markers overlap at high zoom; a radial gradient that fades to 0 opacity
+  at its edge blends softly instead.** The "dots merging into one shape"
+  complaint wasn't a sizing bug — it was a flat-fill regression from an
+  earlier simplification. Fixed by keeping a 3-stop radial gradient
+  (`0% → 30% → 100%`, opacity `1 → 0.65 → 0`) instead of a solid fill.
+- **The Density alpha curve's exponent direction was backwards on a first
+  attempt.** Lowering the exponent (4.5 → 3) to make the surface "more
+  transparent" actually raised opacity in the 0.3–0.7 density range even
+  though the peak was capped — e.g. at t=0.5, exponent 3 gives 0.125
+  before any ceiling is applied, versus 0.044 at the original 4.5. A
+  *higher* exponent (settled on 6) combined with an opacity ceiling
+  (`Math.pow(t, 6) * 0.65`) is what actually reads as more transparent —
+  it's lower than the original curve at every t < 1, not just at the peak.
+
 ## 4. Boundary loading flakiness (needs repro)
 
 - Perú failed to load boundary once on first attempt, worked on retry.

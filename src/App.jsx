@@ -59,7 +59,9 @@ const THEMES = {
     bg: "#0B0C10", border: "rgba(255,255,255,0.035)", borderHover: "rgba(255,255,255,0.09)", grid: "#252525",
     text: "#EDEAE7", textDim: "#9C9591", textFaint: "#84807B",
     bloodRed: "#8B0000", rose: "#A92424", dotRed: "#FF6B4C",
-    heatLow: "#3B0066", heatMid: "#6600CC", heatHigh: "#9D4EDD",
+    regionLow: "#3A0A0A", regionMid: "#B2231F", regionHigh: "#FF1F8F",
+    densityLow: "#3A0A0A", densityMid: "#B2231F", densityHigh: "#FF1F8F",
+    epicenterCore: "#FFD200", epicenterEdge: "#FFD200",
     alertGreen: "#3FD17A", alertYellow: "#D8B93A", alertOrange: "#E0722A", alertRed: "#8B0000", alertNone: "#8C8680",
     palette: ["#2DD8C9", "#B860F5", "#E8A23A"], cardTint: "rgba(255,255,255,0.012)", glowAlpha: [0.28, 0.10],
     surface: "#161217", surfaceBorder: "rgba(255,255,255,0.12)", surfaceShadow: "rgba(0,0,0,0.5)",
@@ -69,7 +71,9 @@ const THEMES = {
     bg: "#F2ECDC", border: "rgba(36,31,26,0.10)", borderHover: "rgba(36,31,26,0.22)", grid: "#D9CFB8",
     text: "#241F1A", textDim: "#5C5346", textFaint: "#655D4D",
     bloodRed: "#8B2318", rose: "#A8481F", dotRed: "#6B3A56",
-    heatLow: "#C9A6E8", heatMid: "#8B3DC9", heatHigh: "#3B0066",
+    regionLow: "#2A1608", regionMid: "#A8481F", regionHigh: "#E8B23A",
+    densityLow: "#C9A6E8", densityMid: "#8B3DC9", densityHigh: "#3B0066",
+    epicenterCore: "#FF007F", epicenterEdge: "#FF8000",
     alertGreen: "#2F6B38", alertYellow: "#8C6D1F", alertOrange: "#A34E1C", alertRed: "#8B2318", alertNone: "#9C9187",
     palette: ["#2E4374", "#A8481F", "#7A6624"], cardTint: "rgba(36,31,26,0.035)", glowAlpha: [0.07, 0.04],
     surface: "#FBF7EC", surfaceBorder: "rgba(36,31,26,0.14)", surfaceShadow: "rgba(36,31,26,0.18)",
@@ -460,10 +464,9 @@ function AlertTooltip({ active, payload }) {
 /* around it that always uses one shared bandwidth). Contours are in ascending  */
 /* threshold order, so painting them low-to-high naturally layers smaller,      */
 /* hotter regions on top of larger, cooler ones with no extra work. Colored     */
-/* with heatRamp() (real published colormap data, red-locked, escalating       */
-/* toward the brightest/most saturated red — the highest-severity color        */
-/* everywhere else in this app) so band-to-band steps are real computed        */
-/* intensity, not visual noise from overlapping shapes.                       */
+/* with densityRamp() (the Density surface's own violet/magenta palette, see   */
+/* the token comment near its definition) so band-to-band steps are real       */
+/* computed intensity, not visual noise from overlapping shapes.               */
 function DensitySurface({ pts, w, h }) {
   const C = React.useContext(ThemeContext);
   const cellPx = 3;
@@ -616,16 +619,14 @@ function DensitySurface({ pts, w, h }) {
             /* scale — an isolated event's visibility no longer depends on what else is   */
             /* on the map.                                                               */
             const t = Math.min(1, c.value);
-            /* No artificial plateau this time — with max() instead of screen-blend       */
-            /* above, t already reflects a real (steep, not artificially flattened)       */
-            /* Gaussian falloff, so a plain power curve is enough on its own. Slightly     */
-            /* softer than before (4.5, not 6) — a very steep curve fades to near-zero     */
-            /* opacity across most of the visible body, not just the rim, and translucent  */
-            /* red loses most of its contrast blended into a light cream background        */
-            /* (unlike the dark theme, where any nonzero opacity still pops against near-   */
-            /* black). This keeps the hard edge-fade while leaving the body legible.        */
-            const alpha = Math.pow(t, 4.5);
-            return <path key={i} d={contourPath(c)} fill={heatRamp(C, t)} fillOpacity={alpha} stroke="none" />;
+            /* Steeper exponent (6, not 4.5) — a lower exponent raises MID-range opacity     */
+            /* even while the peak stays capped, which is what made an earlier attempt at    */
+            /* "more transparent" here (exponent 3) actually look more overbearing, not      */
+            /* less: t=0.5 went from 0.044 to 0.125, before the ceiling even applies. 6 is    */
+            /* lower at every t<1 than the original uncapped 4.5 curve. Combined with a 0.65  */
+            /* ceiling so even the hottest point stays translucent instead of solid.          */
+            const alpha = Math.pow(t, 6) * 0.65;
+            return <path key={i} d={contourPath(c)} fill={densityRamp(C, t)} fillOpacity={alpha} stroke="none" />;
           })}
         </g>
       </g>
@@ -642,32 +643,30 @@ function withAlpha(hex, a) { const { r, g, b } = hexToRgb(hex); return `rgba(${r
 /* recommends Inferno/Magma/Black Body for 2D data like this over plain         */
 /* Viridis, which it specifically flags as having "not as much discrimination"  */
 /* between levels — the opposite of what a density map needs.                  */
-/* heatLow/Mid/High are anchor points lifted directly from real colormap data — */
-/* Inferno for the crimson theme (purple -> magenta -> red), "hot" (the classic */
-/* black-body ramp Moreland's page itself names) for the atlas theme, truncated */
-/* to ONLY its pure-red segment (t before green activates in hot's definition — */
-/* R ramps 0->1 while G and B stay exactly 0), so it's visually distinct from   */
-/* Inferno at a glance — plain red-only, no purple at all — not just a subtly   */
-/* different anchor pick from the same family. Both truncated to skip their     */
-/* near-black starting anchor (needed some baseline visibility against both     */
-/* backgrounds) and to stop before either curve turns orange/yellow, since red  */
-/* is this app's highest-severity color everywhere else (alertRed, bloodRed)    */
-/* and orange/yellow would read as a step down from that, not up. Interpolated  */
-/* between those anchors in HCL (cylindrical Lab) rather than raw RGB, so equal */
-/* steps in density correspond to equal steps in perceived intensity instead of */
-/* the muddy midpoints a straight RGB lerp produces. Shared by the Regions      */
-/* choropleth and the Density                                                  */
-/* contour surface so both map views read as one consistent color language.    */
-function heatRamp(C, t) {
+/* Two SEPARATE token sets, both run through this same HCL ramp — they used to */
+/* share one (heatLow/Mid/High), which meant changing the Density palette      */
+/* silently reskinned Regions too, without anyone asking for that. Interpolated */
+/* in HCL (cylindrical Lab) rather than raw RGB, so equal steps in value        */
+/* correspond to equal steps in perceived intensity instead of the muddy       */
+/* midpoints a straight RGB lerp produces.                                     */
+/* - regionLow/Mid/High: the Regions choropleth's own palette (dark red/brown  */
+/*   -> escalating red/orange -> hot pink/gold) — this is the original ramp    */
+/*   from before the Density rework and should stay that way unless asked.     */
+/* - densityLow/Mid/High: the Density surface's own violet/magenta palette,    */
+/*   the user's explicit final call after several rejected proposals.         */
+function colorRamp(low, mid, high, t) {
   const tc = Math.min(1, Math.max(0, t));
-  const lo = interpolateHcl(C.heatLow, C.heatMid);
-  const hi = interpolateHcl(C.heatMid, C.heatHigh);
+  const lo = interpolateHcl(low, mid);
+  const hi = interpolateHcl(mid, high);
   return tc < 0.5 ? lo(tc / 0.5) : hi((tc - 0.5) / 0.5);
 }
-function heatColor(C, v, max) {
+function densityRamp(C, t) {
+  return colorRamp(C.densityLow, C.densityMid, C.densityHigh, t);
+}
+function regionColor(C, v, max) {
   const t = Math.min(1, v / max);
   if (t === 0) return "rgba(128,128,128,0.06)";
-  return heatRamp(C, t);
+  return colorRamp(C.regionLow, C.regionMid, C.regionHigh, t);
 }
 
 
@@ -841,7 +840,7 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
               const name = r.feature.properties?.shapeName || "?";
               const isHovered = popup && popup.kind === "region" && popup.region.name === name;
               return (
-                <path key={i} d={r.d} fill={heatColor(C, r.count, maxRegionCount)}
+                <path key={i} d={r.d} fill={regionColor(C, r.count, maxRegionCount)}
                   stroke={isHovered ? C.text : withAlpha(C.text, 0.15)} strokeWidth={(isHovered ? 1.4 : 0.5) / k}
                   style={{ cursor: "pointer" }}
                   onMouseEnter={() => { if (!(popup && popup.pinned)) setPopup({ kind: "region", region: { name, count: r.count, events: r.events }, x: r.cx, y: r.cy, pinned: false }); }}
@@ -882,20 +881,20 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
                 {/* ring guarantees they always line up. Kept deliberately small and         */}
                 {/* magnitude-INSENSITIVE (a tight clamp, not a fraction of felt-radius)     */}
                 {/* so it can't balloon the way the first attempt at a separate marker did.  */}
-                {/* A single flat color can't contrast against both what this marker usually  */}
-                {/* sits on (the glow's own hot-core red, ranging dark to bright) AND the     */}
-                {/* page background for the rare near-invisible-glow case — a themed gold      */}
-                {/* worked against the page bg but nearly vanished against the red it's        */}
-                {/* actually drawn on top of (1.2-1.9:1). White + a thin dark outline is the   */}
-                {/* standard fix for exactly this ("halo" markers on maps): white reads        */}
-                {/* clearly against every red in this app's glow range in both themes, and     */}
-                {/* the outline (the theme's own text color, already designed for bg contrast) */}
-                {/* covers the rare case where there's essentially no glow underneath.         */}
+                {/* Per-theme marker gradient: crimson is single-hue gold (Core === Edge, a   */}
+                {/* confirmed-good look, don't retune it), atlas is the original two-tone     */}
+                {/* magenta-to-orange from the palette's settled final call. NOT divided by   */}
+                {/* k, deliberately — should grow somewhat as you zoom in, not stay pinned to  */}
+                {/* a constant screen size like the pulse ring does. The small base clamp      */}
+                {/* (1.5–3.2 local units) keeps it readable at 100% and reasonably sized at    */}
+                {/* high zoom without a separate min/max-by-k rule. Gradient fill (not flat)   */}
+                {/* so overlapping markers blend softly at the edges instead of fusing into    */}
+                {/* a hard blob.                                                               */}
                 <defs>
                   <radialGradient id={`epicenter-${id}`}>
-                    <stop offset="0%" stopColor="#FF007F" stopOpacity="1" />
-                    <stop offset="45%" stopColor="#FF8000" stopOpacity="0.85" />
-                    <stop offset="100%" stopColor="#FF8000" stopOpacity="0" />
+                    <stop offset="0%" stopColor={C.epicenterCore} stopOpacity="1" />
+                    <stop offset="30%" stopColor={C.epicenterCore} stopOpacity="0.65" />
+                    <stop offset="100%" stopColor={C.epicenterEdge} stopOpacity="0" />
                   </radialGradient>
                 </defs>
                 {projected.map((p, i) => (
@@ -904,7 +903,7 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
                 ))}
                 {projected.map((p, i) => (
                   <circle key={`pulse-${i}`} className="liveDot" cx={p.x} cy={p.y} r={3.5 / k}
-                    fill="none" stroke="#FF007F" strokeWidth={0.9 / k} strokeOpacity={0.6}
+                    fill="none" stroke={C.epicenterCore} strokeWidth={0.9 / k} strokeOpacity={0.6}
                     style={{ transformBox: "fill-box", transformOrigin: "center" }} />
                 ))}
               </>
@@ -1010,7 +1009,7 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8, fontSize: 11, color: C.textDim }}>
           <span>{t.regionLegendLabel}</span>
           <span>0</span>
-          <div style={{ flex: 1, maxWidth: 140, height: 8, borderRadius: 4, background: `linear-gradient(90deg, ${C.heatLow}, ${C.heatMid}, ${C.heatHigh})` }} />
+          <div style={{ flex: 1, maxWidth: 140, height: 8, borderRadius: 4, background: `linear-gradient(90deg, ${C.regionLow}, ${C.regionMid}, ${C.regionHigh})` }} />
           <span>{maxRegionCount}</span>
         </div>
       )}
@@ -1018,7 +1017,7 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8, fontSize: 11, color: C.textDim }}>
           <span>{t.densityLegendLabel}</span>
           <span>{t.densityLegendLow}</span>
-          <div style={{ flex: 1, maxWidth: 140, height: 8, borderRadius: 4, background: `linear-gradient(90deg, ${C.heatLow}, ${C.heatMid}, ${C.heatHigh})` }} />
+          <div style={{ flex: 1, maxWidth: 140, height: 8, borderRadius: 4, background: `linear-gradient(90deg, ${C.densityLow}, ${C.densityMid}, ${C.densityHigh})` }} />
           <span>{t.densityLegendHigh}</span>
         </div>
       )}
