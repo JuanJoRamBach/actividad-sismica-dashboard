@@ -12,7 +12,22 @@ that set it.
 
 ---
 
-## 0. Map fitting — RE-VERIFIED, NOT CURRENTLY REPRODUCING
+## 0. Map fitting — FIXED (correction: this was a real fix, not a false positive)
+
+**Correction, 2026-08-21:** an earlier version of this section (below,
+preserved for history) concluded the underfill bug was a misread of a thin
+coastline outline and never a real bug. The user has since clarified that
+account was wrong — the container *sizes* were already standardized before
+that session, but the map projection *inside* the container genuinely
+wasn't filling it correctly, and it was genuinely fixed about 30 minutes
+into that same session. As of 2026-08-21 the user confirms it "works as it
+should with no problems" across the countries checked. Treating this as
+closed, but if it resurfaces, don't trust the analysis below at face
+value — it was arrived at via a flawed verification method (see the
+"pixel-scan" caveat in it) and the conclusion it reached was itself wrong.
+
+<details>
+<summary>Superseded investigation (kept for history, conclusion was wrong)</summary>
 
 Re-investigated 2026-08-20 while working on the density feature (a density
 blob appearing to "float" disconnected from the coastline looked like this
@@ -29,19 +44,15 @@ is how this got misdiagnosed twice in the same session:
   height). Spain: content from y=8 to y=336 of 340 (full height). No gap
   at top or bottom for either country.
 
-**Conclusion: both countries currently fill their card correctly.** What
-looked like a gap in a screenshot was a thin (`opacity: 0.55`), low-contrast
-coastline outline against a near-black background, in a small compressed
-image — easy to misread, especially for Chile's smoother northern desert
-coastline. A single-vertical-line pixel scan (my first check) also gives a
-false negative here since Chile's coastline is a diagonal squiggle, not a
-vertical strip — it can legitimately miss a real line for long stretches.
+**Conclusion (WRONG, see correction above): both countries currently fill
+their card correctly.** What looked like a gap in a screenshot was believed
+to be a thin (`opacity: 0.55`), low-contrast coastline outline against a
+near-black background, in a small compressed image. The actual fix that
+resolved the real underlying bug landed later in the same session — this
+verification pass simply happened to run before that fix, or against a
+code path that didn't exercise the bug.
 
-Leaving this section instead of deleting it so a future session doesn't
-re-diagnose the same false positive. If a real underfill/scaling bug shows
-up again, verify with the pixel-scan method above (or an actual screenshot)
-before trusting a quick visual read — this bug was "fixed," then "confirmed
-still broken" from a misread, twice, in one session.
+</details>
 
 <details>
 <summary>Original bug description (for history)</summary>
@@ -120,14 +131,44 @@ Verified in-browser (dev server): clicking a region pins the popup with
 region name + "N eventos"/"N events", hover shows the thicker stroke,
 legend renders correctly for both Chile and Spain with their own max counts.
 
-**Follow-up requested by user, not yet built:** the region popup currently
-only shows a count ("N eventos"). It should instead show a scrollable list
-of the actual events in that region (place, mag, time — same fields as the
-bubble/epicenter popup), and each event in that list should be a hyperlink
-to its full USGS report at
+**Follow-up requested by user (2026-08-21), NOT YET BUILT — superseded/
+expanded scope, see §6 below.** The region popup currently only shows a
+count ("N eventos"). This grew into a larger cross-tab task during
+discussion on 2026-08-21 — see §6 ("Consistent event-list window across
+all 3 map tabs") for the current, decided scope. Do not implement just the
+narrow "add a list to the region popup" version described in the original
+note below without reading §6 first — the ordering, default-collapsed
+behavior, and cross-tab consistency requirements all live there now.
+
+<details>
+<summary>Original narrower note (superseded, kept for context)</summary>
+
+The region popup currently only shows a count ("N eventos"). It should
+instead show a scrollable list of the actual events in that region (place,
+mag, time — same fields as the bubble/epicenter popup), and each event in
+that list should be a hyperlink to its full USGS report at
 `https://earthquake.usgs.gov/earthquakes/eventpage/{event.id}`. Needs the
 per-region event list, not just the count, threaded from `regionCounts` in
 `CountryMapCard` into the popup render.
+
+</details>
+
+## 2b. Regions tab (ADM1) boundary lines too thin, especially in Atlas (day theme)
+
+**Reported 2026-08-21, not yet fixed.** Same category of bug as the ADM0
+country-outline fix from earlier in this project (see git log — the
+outline was originally `stroke={C.textFaint}` at `strokeWidth={0.8}`,
+`opacity={0.6}`, bumped to `stroke={C.text}` at `strokeWidth={1.5}`,
+`opacity={0.55}` because it was nearly invisible at normal card size). The
+*region* (ADM1) boundary stroke inside the Regions tab is a **separate**
+line in the code and apparently never got the same treatment — in Chile
+the user can't distinguish region borders from each other at all, and in
+Spain they're barely differentiable. Reads worse in Atlas (day theme)
+specifically, consistent with a light theme having less inherent contrast
+margin than the near-black crimson background for a given stroke color/
+opacity. Find the ADM1 `<path>` stroke in `CountryMapCard`'s `regions`
+render branch and apply the same kind of contrast/width bump, verified in
+both themes, not just crimson.
 
 ## 3. Density tab — visual design and color — DONE
 
@@ -226,6 +267,10 @@ all shipped and committed (`1b5ba2a`):
   detail popup (per explicit correction from an earlier version that opened
   a USGS-link popup instead — user wanted map-centering, not a popup).
   New i18n keys `epicenterListTitle/Hint/Collapse/Expand/Empty`.
+  **TODO, requested 2026-08-20 end of session, not yet built:** this panel
+  should default to **collapsed/closed**, not open. Check `listCollapsed`'s
+  initial `useState` value in `CountryMapCard` — it's very likely
+  initialized `false` (open) right now and needs to start `true`.
 - **Real d3-zoom bug found and fixed**: `.transition().duration(x).call(zoomBehaviorRef.current.transform, target)`
   silently no-ops in this environment — confirmed via fresh-module console
   testing (bypassing the app's bundle) that the exact same `.call()` without
@@ -313,47 +358,168 @@ in mind before touching marker rendering again:
   (`Math.pow(t, 6) * 0.65`) is what actually reads as more transparent —
   it's lower than the original curve at every t < 1, not just at the peak.
 
-## 4. Boundary loading flakiness (needs repro)
+## 4. Boundary loading flakiness — LIKELY EXPLAINED, needs the fix in §7
 
 - Perú failed to load boundary once on first attempt, worked on retry.
 - Changing the time-range filter (e.g. Last Month → Last Week) caused **all
   active countries'** boundaries to fail to load simultaneously, even though
-  they'd loaded fine moments before. Time range shouldn't affect ADM0/ADM1
-  fetches at all — suggests an unwanted re-fetch or race condition tied to a
-  re-render triggered by the range change. Needs investigation in the
-  `useEffect` boundary-fetch logic in `CountryMapCard`.
+  they'd loaded fine moments before.
 
-## 5. Performance/freezing (largest — likely several root causes)
+**2026-08-21 update:** during unrelated discussion about GitHub API rate
+limits (see §7), it came out that `fetchBoundary()` has **zero caching** —
+every mount does a fresh `api.github.com` + `media.githubusercontent.com`
+round-trip, with no dedup even across identical requests. Repeated
+add/remove/re-add of countries during a testing session (which is exactly
+what happened in the sessions that hit this) burns through GitHub's
+unauthenticated 60 req/hour-per-IP quota fast, especially since each
+country needs 2–3 requests (meta + SHA resolution + geometry) per level
+(ADM0, and again for ADM1 if Regions is opened). **This is very likely the
+actual cause of the "all boundaries failed to load simultaneously"
+symptom** — not a bug in the time-range logic specifically, but the
+cumulative effect of no caching finally tipping over the rate limit at
+some point in the session, which could coincide with any UI action,
+including a range change. Confirming this requires checking the browser
+console for a 403/rate-limit response at the time of failure (not done
+yet) but building the cache in §7 should resolve this either way, since it
+removes the repeat-fetch pattern that would trigger it. Re-verify this
+item specifically is gone once §7 ships — don't assume it's fixed just
+because the cache landed.
 
-- Switching to the Density tab froze the page for ~1 minute on first hit,
-  several seconds on later switches.
-- Removing a country froze ~10s, then froze again briefly right after.
-- Removing a country froze long enough to trigger Firefox's "this page is
-  slowing down your browser" warning.
-- Dashboard gets slower the longer the session runs (possible leak or
-  unbounded accumulation somewhere — event listeners, un-cleared effects,
-  growing state).
-- Hover tooltip lags behind fast mouse movement, even on a **fresh** load —
-  so there's a baseline responsiveness problem, not just accumulation over
-  time.
-- Scrolling feels janky/stepped rather than smooth.
+## 5. Performance/freezing — PARTIALLY IMPROVED, needs re-verification
 
-This is the biggest bucket and probably has more than one cause. The
-density-tab freeze and the general slowness are worth profiling separately
-before guessing at fixes — likely candidates given the codebase: the
-`DensityField` component's per-point glow rendering approach, and whatever
-recomputes on every country add/remove (projections, region containment
-checks via `geoContains`, which is O(events × regions) and re-run on
-country list changes).
+- ~~Switching to the Density tab froze the page for ~1 minute on first
+  hit, several seconds on later switches.~~ **User confirms 2026-08-21:
+  tab switching no longer freezes.** Not clear what fixed this — no work
+  was specifically aimed at it, so it may be an incidental effect of other
+  changes in the same session (density/regions rework), or of something
+  external (browser update, machine state). Worth a quick sanity check
+  but not re-investigating from scratch.
+- **Still needs re-checking, not confirmed fixed:**
+  - Removing a country froze ~10s, then froze again briefly right after.
+  - Removing a country froze long enough to trigger Firefox's "this page
+    is slowing down your browser" warning.
+  - Dashboard gets slower the longer the session runs (possible leak or
+    unbounded accumulation somewhere).
+  - Hover tooltip lags behind fast mouse movement, even on a fresh load.
+  - Scrolling feels janky/stepped rather than smooth.
+- **New question raised 2026-08-21, not yet answered:** does the map
+  fully re-render/recompute (projection, `path(adm0)`, KDE grid, etc.) on
+  every `mapView` tab switch, even for parts that don't depend on which
+  tab is active (the ADM0 outline and projection shouldn't change between
+  Epicentros/Densidad/Regiones — only what's drawn on top of them
+  should)? If `useMemo` deps are wider than they need to be, tab-switching
+  could be doing far more work than necessary. Check this before assuming
+  the remaining freeze items are only about `DensityField`/`geoContains`
+  cost — it might explain some of item 5's *other* symptoms too, not just
+  the (apparently now-fixed) tab-switch one.
+
+Likely candidates for the still-open items: the `DensityField`/KDE
+per-point computation, and `geoContains` region-containment checks
+(O(events × regions)) re-running on every country add/remove.
+
+## 6. Consistent event-list window across all 3 map tabs — NOT STARTED, scope decided 2026-08-21
+
+Currently only the Density tab has a collapsible event-list panel; the
+other two tabs have nothing (Epicentros) or a legend but no list
+(Regiones), so the card's height visibly differs by tab and jumps when
+you switch. Decided scope, discussed 2026-08-21, don't re-litigate without
+reason:
+
+- **Epicentros tab**: add the same collapsible list panel Density already
+  has, plus a legend below the map (mirroring Regiones' legend), so all 3
+  tabs share the same container height.
+- **Regiones tab**: the *region* popup becomes this tab's version of the
+  panel. Default state is collapsed, showing placeholder copy along the
+  lines of "Press a region to show events" (exact i18n string still TBD —
+  needs both `es`/`en`). No region selected → stays closed. User clicks a
+  region → panel opens showing that region's actual event list (not just
+  the count it shows today — see the superseded note in §2 for the
+  original narrower version of this ask, now folded into this item).
+- **Density tab**: the epicenter markers (the small pulsar dots on the KDE
+  surface) currently have no hover interaction at all. They should get
+  the **same hover popup Epicentros' bubbles already have** (place, mag,
+  depth, time) — this is new interactive surface for Density, not a
+  redesign of the existing list panel.
+- **Ordering must be decided once and applied consistently across all 3
+  tabs' lists** — currently unspecified/accidental (probably just
+  USGS API response order for the existing Density list, never chosen on
+  purpose). Options discussed: most recent first, strongest magnitude
+  first, or nearest-to-viewport-center first. **Needs an explicit decision
+  before implementation** — whatever's chosen affects list-header/hint
+  copy too (e.g. "most recent" vs "largest"), so don't build 3 different
+  orders by accident by copy-pasting without deciding first.
+- **Open technical question, check before or during implementation:**
+  does `CountryMapCard` recompute the map projection/paths on every
+  `mapView` tab switch even though the underlying boundary/projection
+  doesn't change between tabs? See the note in §5 — this may be a
+  legitimate performance bug in its own right, and touching this code for
+  the list-panel work is a natural point to check it, but treat it as a
+  separate, verifiable finding, not an assumption baked into this task.
+
+**User's explicit process preference for this item, given its size:**
+tackle it in disciplined pieces with individual commits per sub-piece
+(each still requires asking before pushing, per the standing rule at the
+top of this file) rather than one large uncommitted pass — easier to
+isolate and revert if a specific piece goes wrong.
+
+## 7. GitHub API boundary-fetch caching — NOT STARTED, priority raised 2026-08-21
+
+Previously logged as a low-priority "nice to have" (see HANDOFF.md). Re-
+scoped upward after clarifying the actual mechanics of GitHub's rate
+limit, discussed 2026-08-21:
+
+- GitHub's unauthenticated REST API limit (60 requests/hour) is scoped to
+  **the calling IP address across ALL of `api.github.com`**, not per-app,
+  per-origin, or per-referrer, and not a shared account-wide pool that all
+  dashboard visitors draw from together. Each visitor spends their own
+  budget — so this is not a "the app breaks under real traffic" risk.
+- **But it's still a real problem worth fixing on principle:** since the
+  quota is shared across *everything* that visitor's browser does against
+  GitHub's API that hour — not just our app — repeatedly burning it here
+  could leave a visitor rate-limited on some *unrelated* GitHub-backed
+  tool they use the same hour. That's an inconsiderate side effect of our
+  own lack of caching, not something to shrug off just because it isn't a
+  scaling risk. Direct quote from the user on this: "we can't inconvenience
+  the User because of our bad practice."
+- `fetchBoundary()` currently has **no caching at all** — confirmed in
+  code, every mount does a fresh 2–3-request round trip (meta lookup, SHA
+  resolution via `api.github.com`, geometry fetch) with no dedup even for
+  identical repeat requests within the same session.
+- **Fix**: cache resolved boundary GeoJSON keyed by `{iso3}-{level}`
+  (localStorage, since country/region borders essentially never change —
+  a long TTL, maybe weeks-to-months, is reasonable; consider no TTL at
+  all with a manual-bust escape hatch instead of guessing a "correct"
+  expiry). This should also make the app feel snappier on repeat visits/
+  repeat country toggling generally, independent of the rate-limit angle.
+- Also worth checking while in this code: whether something is firing
+  *more* fetch calls than the true minimum per add (e.g. an effect
+  re-running extra times, possibly React StrictMode double-invocation in
+  dev inflating the apparent problem) — separate from "no cache exists,"
+  since that would make the rate-limit problem worse than the baseline
+  no-cache case alone would.
+- Related to and likely explains item 4 (boundary loading flakiness) —
+  see that section for the connection.
 
 ---
 
 ## Suggested order of attack
 
-Smallest → largest, per the user's instruction:
+Smallest → largest, per the user's instruction. Items 4/5/6/7 below were
+discussed together on 2026-08-21 and the user asked to tackle them one at
+a time — order kept smallest-to-largest per this project's established
+convention unless told otherwise:
 1. ~~Popup/tooltip contrast (isolated CSS/token fix)~~ — DONE
 2. ~~Regions tab legend + click/hover affordance~~ — DONE
 3. ~~Density tab color + rendering approach~~ — DONE
-4. Map fitting (Spain and other non-tall countries)
-5. Boundary-fetch-on-range-change bug
-6. Performance/freeze investigation (needs profiling, not just code reading)
+4. ~~Map fitting~~ — DONE (see corrected §0)
+5. Regions tab (ADM1) boundary lines too thin, esp. Atlas/day theme (§2b)
+   — small, contained, same pattern as the earlier ADM0 outline fix
+6. GitHub API boundary caching (§7) — medium, contained, real user-impact
+   fix, likely also resolves item 4 (boundary loading flakiness)
+7. Performance re-verification (§5) — re-check remaining freeze symptoms
+   now that tab-switching is confirmed fixed; check the tab-switch
+   recompute question while here
+8. Consistent event-list window across all 3 tabs (§6) — largest, most
+   decisions required (ordering, Density hover parity, Regiones window
+   behavior), tackle in individually-committed pieces per the user's
+   stated preference
