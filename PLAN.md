@@ -385,7 +385,7 @@ removes the repeat-fetch pattern that would trigger it. Re-verify this
 item specifically is gone once §7 ships — don't assume it's fixed just
 because the cache landed.
 
-## 5. Performance/freezing — PARTIALLY IMPROVED, needs re-verification
+## 5. Performance/freezing — MOSTLY FIXED, one item (scrolling) unverified
 
 - ~~Switching to the Density tab froze the page for ~1 minute on first
   hit, several seconds on later switches.~~ **User confirms 2026-08-21:
@@ -422,11 +422,51 @@ because the cache landed.
   re-rendering (44→22 contour paths, correctly dropping only Spain's),
   not a multi-second freeze.
 
-- **Still needs re-checking, not confirmed fixed:**
-  - Dashboard gets slower the longer the session runs (possible leak or
-    unbounded accumulation somewhere).
-  - Hover tooltip lags behind fast mouse movement, even on a fresh load.
-  - Scrolling feels janky/stepped rather than smooth.
+- **~~Hover tooltip lags behind fast mouse movement, even on a fresh
+  load~~ — FIXED, 2026-08-21.** recharts' `<Tooltip>` defaults to
+  `isAnimationActive={true}` with a ~400ms position/opacity transition.
+  Every chart's data series already had `isAnimationActive={false}` for
+  the same reason; the 8 `<Tooltip>` components themselves never did.
+  Added it to all 8, matching the existing pattern.
+
+- **~~Dashboard gets slower the longer the session runs~~ — FIXED (most
+  likely explanation found and fixed), 2026-08-21.** `cutoff` (`Date.now()
+  - RANGE_MS[range]`) was NOT memoized — recomputed fresh on every `App`
+  render, a new millisecond-precision value nearly every time, regardless
+  of whether `range` actually changed. Since `filtered`'s `useMemo`
+  depends on `cutoff`, this meant ANY App-level state change at all —
+  toggling focus, opening the country picker, anything — forced a full
+  re-filter of every active country's events, cascading into the exact
+  same expensive downstream recompute (KDE, region counts) the
+  `activeCountries` fix above addressed, just triggered by far more than
+  country add/remove. Over a real session with many small interactions,
+  this compounds — a very plausible full explanation for "gets slower
+  the longer the session runs" without needing an actual memory leak.
+  Memoized on `[range]` only.
+
+  **Verified, not assumed:** tagged the live contour-path DOM nodes for
+  Chile (Density open, "Último año"), then toggled focus — an App-level
+  state change unrelated to filtering or range. Chile's contour paths
+  were confirmed to be the exact same DOM nodes afterward, not
+  recreated, proving `densityData` didn't recompute at all for an
+  unrelated interaction.
+
+- **Scrolling feels janky/stepped rather than smooth — INVESTIGATED, no
+  distinct cause found.** Checked for the usual suspects: no global
+  `scroll`/`mousemove` listeners, no `backdrop-filter` usage, only 2
+  `feGaussianBlur` filters in the whole app (both gated behind Density
+  being open for a specific country, not always-present). No dedicated
+  scroll-handling code exists at all — scrolling is native browser
+  behavior here, nothing intercepts it. Given that, and given how much
+  of this session's actual freeze-causing work (KDE recompute, the two
+  cascading-recompute bugs above) was capable of blocking the main
+  thread at effectively random moments — including mid-scroll — it's
+  plausible the "jank" was a symptom of those bugs rather than a
+  separate scroll-specific issue. Not marking this DONE since that's an
+  inference, not something verified the way the other two above were.
+  **Re-test after the fixes above; if it's still janky, this needs real
+  browser profiling tools (Chrome DevTools Performance tab) to find a
+  concrete cause — not available in this environment.**
 - **~~New question raised 2026-08-21~~ — ANSWERED, and partially fixed,
   2026-08-21.** Checked `useMemo` deps directly rather than guessing:
   `projection`/`path` (deps `[adm0, W, H]`) and `regionCounts` (deps
