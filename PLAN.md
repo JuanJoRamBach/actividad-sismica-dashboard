@@ -522,9 +522,42 @@ because the cache landed.
 (Country removal and tooltip lag are now fixed, documented earlier in
 this section — this stale note originally listed them as candidates
 before that work happened. Only scrolling jank remains genuinely
-unverified; `geoContains` region-containment cost was never actually
-investigated as a cause, since the real country-removal cause turned
-out to be the `filtered`/`cutoff` cascade instead.)
+unverified.)
+
+## 5b. Real ~1min freeze switching Densidad→Regiones with a high-activity country — FIXED, 2026-08-21
+
+The `geoContains` candidate above turned out to be real — found and
+fixed after the user reported switching Densidad→Regiones with
+Chile+Japan+USA(California) all active took nearly a minute, then
+another minute for USA specifically to finish. `regionCounts`'
+`geoContains()` call is a naive O(events × regions) scan over the
+**full uncapped** event set (deliberately uncapped — a choropleth
+needs accurate counts, see the reasoning already in §6's "Regiones"
+notes about why capping there would break it).
+
+**Measured, not guessed**: downloaded Japan's real "Último año" dataset
+(1314 events via USGS) and its real ADM1 boundaries (47 prefectures),
+timed the actual naive `geoContains` cost in Node: **5545ms for 61758
+point-in-polygon checks, on ONE country.** With Chile and USA computing
+their own `regionCounts` on the same synchronous render, this plausibly
+stacks to the ~1 minute reported.
+
+**Fix**: `geometryBBox()` computes each region's bounding box once (a
+cheap flat coordinate scan — deliberately not through `d3.geoBounds`,
+the function whose ring-winding bug caused the original planet-scale
+map issue, and irrelevant here since a bbox check doesn't care about
+winding direction), then a cheap bbox check runs before the expensive
+`geoContains` ray-cast. Same Japan dataset: **5545ms → 83ms (67x)**,
+only 1.2% of combinations actually needed the real check. Zero accuracy
+cost — every event is still correctly tested.
+
+**Verified in-browser with the user's exact reported scenario recreated
+live** (Chile 549 + Japan 1303 + USA-California 958 real events,
+"Último año", Densidad→Regiones): all 119 region paths across all 3
+countries render correctly, no console errors. Remaining wait is
+legitimate first-time ADM1 network fetch for 3 countries at once
+(cached after first visit per the earlier localStorage fix), not a
+computation freeze.
 
 ## 6. Consistent event-list window across all 3 map tabs — DONE, 2026-08-21
 
