@@ -371,6 +371,23 @@ function mainlandRing(gj) {
   return best ? { type: "Feature", properties: {}, geometry: { type: "Polygon", coordinates: best } } : null;
 }
 
+/* [minX, minY, maxX, maxY] of a Polygon/MultiPolygon geometry — used as a cheap  */
+/* pre-filter in front of the expensive geoContains() ray-cast (see regionCounts  */
+/* in CountryMapCard). A plain flat coordinate scan, deliberately not going       */
+/* through d3.geoBounds — that's the same function whose backwards-ring-winding   */
+/* interpretation caused the original planet-scale map bug, and it's not needed   */
+/* here anyway since a bbox check doesn't care about a ring's winding direction.  */
+function geometryBBox(geometry) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  const walk = (coords, depth) => {
+    if (depth === 0) { const [x, y] = coords; if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y; return; }
+    coords.forEach((c) => walk(c, depth - 1));
+  };
+  const depth = geometry.type === "Polygon" ? 2 : geometry.type === "MultiPolygon" ? 3 : -1;
+  if (depth >= 0) walk(geometry.coordinates, depth);
+  return [minX, minY, maxX, maxY];
+}
+
 /* ---------------------------------------------------------------------- */
 /* Utilidades de formato                                                   */
 /* ---------------------------------------------------------------------- */
@@ -1058,10 +1075,23 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
   /* separate, smaller safety-net cap (EVENT_LIST_DISPLAY_CAP) if a single region */
   /* somehow has 100+ events of its own, which is far less likely than a whole    */
   /* country doing so.                                                            */
+  /* Cheap bbox check before the expensive geoContains() ray-cast — most events    */
+  /* aren't anywhere near most regions, so a bbox reject avoids the costly check    */
+  /* almost entirely. Measured on Japan's real "Último año" dataset (1314 events,   */
+  /* 47 prefectures, 61758 combinations): 5545ms naive -> 83ms with this filter,    */
+  /* only 1.2% of combinations actually needed the real geoContains call. This is   */
+  /* very likely what was behind the near-1-minute freeze switching into Regiones   */
+  /* with a high-activity country active — the FULL uncapped event set is kept     */
+  /* (see the comment above about why capping this would break the choropleth),    */
+  /* this only makes the SAME correct computation faster, no accuracy tradeoff.    */
   const regionCounts = useMemo(() => {
     if (!adm1 || !path) return null;
     return adm1.features.map((f) => {
-      const regionEvents = events.filter((e) => geoContains(f, [e.lon, e.lat]));
+      const [minX, minY, maxX, maxY] = geometryBBox(f.geometry);
+      const regionEvents = events.filter((e) => {
+        if (e.lon < minX || e.lon > maxX || e.lat < minY || e.lat > maxY) return false;
+        return geoContains(f, [e.lon, e.lat]);
+      });
       const c = path.centroid(f);
       return { feature: f, count: regionEvents.length, events: regionEvents, d: path(f), cx: c[0] + 8, cy: c[1] + 8 };
     });
