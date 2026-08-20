@@ -568,6 +568,35 @@ across tab switches within a session; Density markers show the hover
 popup with place/magnitude/depth/time and a USGS link; switching tabs no
 longer leaves a stale popup behind. No console errors at any step.
 
+**Follow-up fixes, 2026-08-21 (user caught these after testing the above):**
+
+1. Panels defaulted to open (`listCollapsed` started `false`) — fixed to
+   start closed on all 3 tabs, and to stay wherever the user last left
+   them (removed the auto-expand-on-region-click behavior too, for the
+   same reason — it shouldn't reopen on its own).
+2. Clicking a region used to "pin" the floating popup open, so it stuck
+   around on screen alongside the docked panel — both showing the same
+   info at once. Fixed by removing the "pinned" concept entirely (it
+   was never used by bubbles/density markers, only regions) — the
+   floating popup is now a pure hover preview, and region selection for
+   the docked panel is its own separate state (`selectedRegion`).
+3. User reported a 15s freeze switching to "Último año" — **could not
+   reproduce on the dev server** after this session's earlier fixes
+   (KDE clustering, recompute-on-remount, `cutoff` memoization): timed
+   every combination (Epicentros/Densidad, panel open/closed, range
+   switch) via `requestAnimationFrame` delay probes, got 300ms–1.2s
+   across the board, nowhere near 15s. **Most likely explanation: this
+   was tested against the deployed Cloudflare build, which still has
+   the pre-fix code — nothing from this session has been merged/
+   deployed yet.** Re-verify once merged and deployed before assuming
+   there's still a real bug here. Implemented the requested display cap
+   regardless since it's independently worthwhile: `EVENT_LIST_DISPLAY_
+   CAP = 100`, applied after sorting (so "top 100" is the true top 100
+   for whichever sort mode is active), with a visible "showing top 100
+   of N" note — a display-only cap on the list widget; the map itself
+   (bubbles/density) still renders every real event, nothing is hidden
+   from the actual visualization.
+
 <details>
 <summary>Original scope note (for history — now implemented as described above)</summary>
 
