@@ -1246,7 +1246,18 @@ export default function App() {
 
   useEffect(() => { if (!visibleCountries.includes(magTab) && magTab !== "comparacion") setMagTab(visibleCountries[0]); }, [visibleCountries.join(","), magTab]);
 
-  const cutoff = Date.now() - RANGE_MS[range];
+  /* Memoized on [range] only — NOT recomputed fresh every render. It used to be a  */
+  /* plain `Date.now() - RANGE_MS[range]`, which produced a new value on nearly     */
+  /* every render (different millisecond timestamp) regardless of whether `range`   */
+  /* actually changed. Since filtered's useMemo depends on cutoff, that meant ANY   */
+  /* App-level state change at all — toggling focus, opening the country picker,    */
+  /* anything — forced a full re-filter of every active country's events and        */
+  /* cascaded into the same expensive downstream recompute (KDE, region counts)     */
+  /* the activeCountries fix above addressed, just triggered more broadly. This is  */
+  /* the likely explanation for "the dashboard gets slower the longer the session   */
+  /* runs" — every interaction anywhere adds to that cost, not just map-specific    */
+  /* actions.                                                                       */
+  const cutoff = useMemo(() => Date.now() - RANGE_MS[range], [range]);
   const granularity = range === "day" ? "hour" : range === "year" ? "week" : "day";
 
   /* Deliberately NOT keyed on activeCountries: filtering over Object.keys(data)   */
@@ -1440,7 +1451,7 @@ export default function App() {
                           <CartesianGrid stroke={C.grid} vertical={false} />
                           <XAxis dataKey="x" type="number" domain={["dataMin", "dataMax"]} tickFormatter={(v) => fmtAxisTime(v, granularity, lang)} stroke={C.textFaint} fontSize={11} />
                           <YAxis domain={[0, "dataMax + 1"]} stroke={C.textFaint} fontSize={11} />
-                          <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} labelFormatter={(v) => fmtLocalTime(v, id, lang)} formatter={(v) => [v, t.magAxis]} />
+                          <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} labelFormatter={(v) => fmtLocalTime(v, id, lang)} formatter={(v) => [v, t.magAxis]} isAnimationActive={false} />
                           <Line type="monotone" dataKey="mag" stroke={colorFor(id)} strokeWidth={2.8} dot={false} isAnimationActive={false} />
                         </LineChart>
                       </ResponsiveContainer>
@@ -1460,7 +1471,7 @@ export default function App() {
                         <CartesianGrid stroke={C.grid} vertical={false} />
                         <XAxis dataKey="x" type="number" domain={["dataMin", "dataMax"]} tickFormatter={(v) => fmtAxisTime(v, granularity, lang)} stroke={C.textFaint} fontSize={11} />
                         <YAxis stroke={C.textFaint} fontSize={11} />
-                        <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} labelFormatter={(v) => fmtAxisTime(v, granularity, lang)} />
+                        <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} labelFormatter={(v) => fmtAxisTime(v, granularity, lang)} isAnimationActive={false} />
                         <Legend wrapperStyle={{ fontSize: 12 }} formatter={(v) => countryLabel(v, lang) || v} />
                         {visibleCountries.map((id) => <Area key={id} type="monotone" dataKey={id} stroke={colorFor(id)} strokeWidth={2.5} fill={`url(#gradD-${id})`} isAnimationActive={false} />)}
                       </AreaChart>
@@ -1480,7 +1491,7 @@ export default function App() {
                         <CartesianGrid stroke={C.grid} vertical={false} />
                         <XAxis dataKey="x" type="number" domain={["dataMin", "dataMax"]} tickFormatter={(v) => fmtAxisTime(v, granularity, lang)} stroke={C.textFaint} fontSize={11} />
                         <YAxis domain={[0, "dataMax + 1"]} stroke={C.textFaint} fontSize={11} />
-                        <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} labelFormatter={(v) => fmtLocalTime(v, magTab || visibleCountries[0], lang)} formatter={(v) => [v, t.magAxis]} />
+                        <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} labelFormatter={(v) => fmtLocalTime(v, magTab || visibleCountries[0], lang)} formatter={(v) => [v, t.magAxis]} isAnimationActive={false} />
                         <Line type="monotone" dataKey="mag" stroke={colorFor(magTab || visibleCountries[0])} strokeWidth={2.8} dot={false} isAnimationActive={false} />
                       </LineChart>
                     </ResponsiveContainer>
@@ -1496,7 +1507,7 @@ export default function App() {
                         <CartesianGrid stroke={C.grid} vertical={false} />
                         <XAxis dataKey="x" type="number" domain={["dataMin", "dataMax"]} tickFormatter={(v) => fmtAxisTime(v, granularity, lang)} stroke={C.textFaint} fontSize={11} />
                         <YAxis stroke={C.textFaint} fontSize={11} />
-                        <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} labelFormatter={(v) => fmtAxisTime(v, granularity, lang)} />
+                        <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} labelFormatter={(v) => fmtAxisTime(v, granularity, lang)} isAnimationActive={false} />
                         <Legend wrapperStyle={{ fontSize: 12 }} formatter={(v) => countryLabel(v, lang) || v} />
                         {visibleCountries.map((id) => <Area key={id} type="monotone" dataKey={id} stroke={colorFor(id)} strokeWidth={2.5} fill={`url(#gradM-${id})`} isAnimationActive={false} />)}
                       </AreaChart>
@@ -1512,7 +1523,7 @@ export default function App() {
                   <CartesianGrid stroke={C.grid} vertical={false} />
                   <XAxis dataKey="x" type="number" domain={["dataMin", "dataMax"]} tickFormatter={(v) => fmtAxisTime(v, granularity, lang)} stroke={C.textFaint} fontSize={11} />
                   <YAxis stroke={C.textFaint} fontSize={11} />
-                  <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} labelFormatter={(v) => fmtAxisTime(v, granularity, lang)} />
+                  <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} labelFormatter={(v) => fmtAxisTime(v, granularity, lang)} isAnimationActive={false} />
                   <Legend wrapperStyle={{ fontSize: 12 }} formatter={(v) => countryLabel(v, lang) || v} />
                   {visibleCountries.map((id) => <Line key={id} type="stepAfter" dataKey={id} stroke={colorFor(id)} strokeWidth={2.8} dot={false} isAnimationActive={false} />)}
                 </LineChart>
@@ -1527,7 +1538,7 @@ export default function App() {
                   <CartesianGrid stroke={C.grid} vertical={false} />
                   <XAxis dataKey="bin" stroke={C.textFaint} fontSize={11} />
                   <YAxis stroke={C.textFaint} fontSize={11} />
-                  <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} />
+                  <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} isAnimationActive={false} />
                   <Legend wrapperStyle={{ fontSize: 12 }} formatter={(v) => countryLabel(v, lang) || v} />
                   {visibleCountries.map((id) => <Bar key={id} dataKey={id} fill={colorFor(id)} radius={[4, 4, 0, 0]} isAnimationActive={false} />)}
                 </BarChart>
@@ -1543,7 +1554,7 @@ export default function App() {
                       <XAxis dataKey="depth" name={t.depthAxis} unit=" km" stroke={C.textFaint} fontSize={11} />
                       <YAxis dataKey="mag" name={t.magAxis} stroke={C.textFaint} fontSize={11} />
                       <ZAxis range={[30, 30]} />
-                      <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} cursor={{ stroke: C.textFaint }} formatter={(v, n) => [v, n === "depth" ? `${t.depthAxis} (km)` : t.magAxis]} />
+                      <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} cursor={{ stroke: C.textFaint }} formatter={(v, n) => [v, n === "depth" ? `${t.depthAxis} (km)` : t.magAxis]} isAnimationActive={false} />
                       <Scatter data={depthScatter(id)} isAnimationActive={false}>
                         {depthScatter(id).map((e, i) => <Cell key={i} fill={ALERT_COLOR[e.alert]} fillOpacity={0.85} />)}
                       </Scatter>
@@ -1566,7 +1577,7 @@ export default function App() {
                       <Pie data={alertBreakdown(id)} dataKey="value" nameKey="name" innerRadius={52} outerRadius={80} paddingAngle={2} isAnimationActive={false}>
                         {alertBreakdown(id).map((e, i) => <Cell key={i} fill={ALERT_COLOR[e.key]} />)}
                       </Pie>
-                      <Tooltip content={<AlertTooltip />} />
+                      <Tooltip content={<AlertTooltip />} isAnimationActive={false} />
                       <Legend wrapperStyle={{ fontSize: 12 }} />
                     </PieChart>
                   </ResponsiveContainer>
