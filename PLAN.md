@@ -153,22 +153,16 @@ per-region event list, not just the count, threaded from `regionCounts` in
 
 </details>
 
-## 2b. Regions tab (ADM1) boundary lines too thin, especially in Atlas (day theme)
+## 2b. Regions tab (ADM1) boundary lines too thin, especially in Atlas (day theme) — DONE
 
-**Reported 2026-08-21, not yet fixed.** Same category of bug as the ADM0
-country-outline fix from earlier in this project (see git log — the
-outline was originally `stroke={C.textFaint}` at `strokeWidth={0.8}`,
-`opacity={0.6}`, bumped to `stroke={C.text}` at `strokeWidth={1.5}`,
-`opacity={0.55}` because it was nearly invisible at normal card size). The
-*region* (ADM1) boundary stroke inside the Regions tab is a **separate**
-line in the code and apparently never got the same treatment — in Chile
-the user can't distinguish region borders from each other at all, and in
-Spain they're barely differentiable. Reads worse in Atlas (day theme)
-specifically, consistent with a light theme having less inherent contrast
-margin than the near-black crimson background for a given stroke color/
-opacity. Find the ADM1 `<path>` stroke in `CountryMapCard`'s `regions`
-render branch and apply the same kind of contrast/width bump, verified in
-both themes, not just crimson.
+Fixed on the sibling branch `fix/regions-boundary-contrast` (commit
+`1806bfa`), not yet merged into this branch as of this writing — that's
+why this section looked stale/unfixed here. Bumped the default
+(non-hovered) region border from `withAlpha(C.text, 0.15)` at
+`0.5 / k` to `withAlpha(C.text, 0.5)` at `0.9 / k`, hovered state to
+`1.6 / k` full opacity. User-verified in-browser: "Lines are perfect,
+I can clearly see the regions in Chile." Will land here automatically
+once the branches are merged.
 
 ## 3. Density tab — visual design and color — DONE
 
@@ -267,10 +261,9 @@ all shipped and committed (`1b5ba2a`):
   detail popup (per explicit correction from an earlier version that opened
   a USGS-link popup instead — user wanted map-centering, not a popup).
   New i18n keys `epicenterListTitle/Hint/Collapse/Expand/Empty`.
-  **TODO, requested 2026-08-20 end of session, not yet built:** this panel
-  should default to **collapsed/closed**, not open. Check `listCollapsed`'s
-  initial `useState` value in `CountryMapCard` — it's very likely
-  initialized `false` (open) right now and needs to start `true`.
+  **~~TODO~~ — DONE.** Fixed as part of §6's follow-up fixes below:
+  `listCollapsed` now starts `true` (closed) on all 3 tabs, not just
+  Density.
 - **Real d3-zoom bug found and fixed**: `.transition().duration(x).call(zoomBehaviorRef.current.transform, target)`
   silently no-ops in this environment — confirmed via fresh-module console
   testing (bypassing the app's bundle) that the exact same `.call()` without
@@ -526,10 +519,12 @@ because the cache landed.
   non-clustered event set) needs them — clustering helps least exactly
   when data isn't clustered.
 
-Likely candidates for the other still-open freeze items (country removal,
-tooltip lag, scrolling jank): `geoContains` region-containment checks
-(O(events × regions)) re-running on every country add/remove — not yet
-investigated.
+(Country removal and tooltip lag are now fixed, documented earlier in
+this section — this stale note originally listed them as candidates
+before that work happened. Only scrolling jank remains genuinely
+unverified; `geoContains` region-containment cost was never actually
+investigated as a cause, since the real country-removal cause turned
+out to be the `filtered`/`cutoff` cascade instead.)
 
 ## 6. Consistent event-list window across all 3 map tabs — DONE, 2026-08-21
 
