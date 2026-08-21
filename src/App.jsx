@@ -760,13 +760,21 @@ function DensitySurface({ contours, padCells, maxVal, w, h }) {
             /* peak) would clip everything above that ceiling to the same "hottest" color,     */
             /* losing exactly the differentiation this change exists to create.               */
             const t = maxVal > 0 ? Math.min(1, c.value / maxVal) : 0;
-            /* Steeper exponent (6, not 4.5) — a lower exponent raises MID-range opacity     */
-            /* even while the peak stays capped, which is what made an earlier attempt at    */
-            /* "more transparent" here (exponent 3) actually look more overbearing, not      */
-            /* less: t=0.5 went from 0.044 to 0.125, before the ceiling even applies. 6 is    */
-            /* lower at every t<1 than the original uncapped 4.5 curve. Combined with a 0.65  */
-            /* ceiling so even the hottest point stays translucent instead of solid.          */
-            const alpha = Math.pow(t, 6) * 0.65;
+            /* REPLACED the old pow(t,6)*0.65 curve (2026-08-21) — it was tuned for a          */
+            /* completely different goal (a soft glow where only the hot core should read as   */
+            /* solid, everything else dissipates) that no longer applies now that the field is  */
+            /* meant to look like a real multi-band heatmap (distinct visible color at every    */
+            /* density level, matching real KDE/contour tools). That exponent-6 curve was so     */
+            /* steep it made every band except the very peak nearly invisible — verified         */
+            /* numerically, accounting for how the 22 nested threshold bands actually composite  */
+            /* together (effective opacity = 1 - product(1-alpha) across every band whose        */
+            /* threshold the point clears): the old curve gave ~1.6% effective opacity at t=0.5   */
+            /* and ~8% at t=0.7 — exactly "I don't see the other colors, just a stain with a      */
+            /* halo". This curve was tuned the same way (composited, not just the raw per-band    */
+            /* value) to land near 18%/40%/64%/85% effective opacity at t=0.2/0.5/0.85/1.0 —      */
+            /* every band clearly visible, peak strong but still short of fully solid so          */
+            /* epicenter markers stay the highest-contrast thing on top of it.                    */
+            const alpha = 0.025 + Math.pow(t, 1.1) * 0.11;
             return <path key={i} d={contourPath(c)} fill={densityRamp(C, t)} fillOpacity={alpha} stroke="none" />;
           })}
         </g>
