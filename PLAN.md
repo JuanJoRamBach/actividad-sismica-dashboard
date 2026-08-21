@@ -153,22 +153,16 @@ per-region event list, not just the count, threaded from `regionCounts` in
 
 </details>
 
-## 2b. Regions tab (ADM1) boundary lines too thin, especially in Atlas (day theme)
+## 2b. Regions tab (ADM1) boundary lines too thin, especially in Atlas (day theme) — DONE
 
-**Reported 2026-08-21, not yet fixed.** Same category of bug as the ADM0
-country-outline fix from earlier in this project (see git log — the
-outline was originally `stroke={C.textFaint}` at `strokeWidth={0.8}`,
-`opacity={0.6}`, bumped to `stroke={C.text}` at `strokeWidth={1.5}`,
-`opacity={0.55}` because it was nearly invisible at normal card size). The
-*region* (ADM1) boundary stroke inside the Regions tab is a **separate**
-line in the code and apparently never got the same treatment — in Chile
-the user can't distinguish region borders from each other at all, and in
-Spain they're barely differentiable. Reads worse in Atlas (day theme)
-specifically, consistent with a light theme having less inherent contrast
-margin than the near-black crimson background for a given stroke color/
-opacity. Find the ADM1 `<path>` stroke in `CountryMapCard`'s `regions`
-render branch and apply the same kind of contrast/width bump, verified in
-both themes, not just crimson.
+Fixed on the sibling branch `fix/regions-boundary-contrast` (commit
+`1806bfa`), not yet merged into this branch as of this writing — that's
+why this section looked stale/unfixed here. Bumped the default
+(non-hovered) region border from `withAlpha(C.text, 0.15)` at
+`0.5 / k` to `withAlpha(C.text, 0.5)` at `0.9 / k`, hovered state to
+`1.6 / k` full opacity. User-verified in-browser: "Lines are perfect,
+I can clearly see the regions in Chile." Will land here automatically
+once the branches are merged.
 
 ## 3. Density tab — visual design and color — DONE
 
@@ -267,10 +261,9 @@ all shipped and committed (`1b5ba2a`):
   detail popup (per explicit correction from an earlier version that opened
   a USGS-link popup instead — user wanted map-centering, not a popup).
   New i18n keys `epicenterListTitle/Hint/Collapse/Expand/Empty`.
-  **TODO, requested 2026-08-20 end of session, not yet built:** this panel
-  should default to **collapsed/closed**, not open. Check `listCollapsed`'s
-  initial `useState` value in `CountryMapCard` — it's very likely
-  initialized `false` (open) right now and needs to start `true`.
+  **~~TODO~~ — DONE.** Fixed as part of §6's follow-up fixes below:
+  `listCollapsed` now starts `true` (closed) on all 3 tabs, not just
+  Density.
 - **Real d3-zoom bug found and fixed**: `.transition().duration(x).call(zoomBehaviorRef.current.transform, target)`
   silently no-ops in this environment — confirmed via fresh-module console
   testing (bypassing the app's bundle) that the exact same `.call()` without
@@ -385,7 +378,7 @@ removes the repeat-fetch pattern that would trigger it. Re-verify this
 item specifically is gone once §7 ships — don't assume it's fixed just
 because the cache landed.
 
-## 5. Performance/freezing — PARTIALLY IMPROVED, needs re-verification
+## 5. Performance/freezing — MOSTLY FIXED, one item (scrolling) unverified
 
 - ~~Switching to the Density tab froze the page for ~1 minute on first
   hit, several seconds on later switches.~~ **User confirms 2026-08-21:
@@ -394,30 +387,261 @@ because the cache landed.
   changes in the same session (density/regions rework), or of something
   external (browser update, machine state). Worth a quick sanity check
   but not re-investigating from scratch.
-- **Still needs re-checking, not confirmed fixed:**
-  - Removing a country froze ~10s, then froze again briefly right after.
-  - Removing a country froze long enough to trigger Firefox's "this page
-    is slowing down your browser" warning.
-  - Dashboard gets slower the longer the session runs (possible leak or
-    unbounded accumulation somewhere).
-  - Hover tooltip lags behind fast mouse movement, even on a fresh load.
-  - Scrolling feels janky/stepped rather than smooth.
-- **New question raised 2026-08-21, not yet answered:** does the map
-  fully re-render/recompute (projection, `path(adm0)`, KDE grid, etc.) on
-  every `mapView` tab switch, even for parts that don't depend on which
-  tab is active (the ADM0 outline and projection shouldn't change between
-  Epicentros/Densidad/Regiones — only what's drawn on top of them
-  should)? If `useMemo` deps are wider than they need to be, tab-switching
-  could be doing far more work than necessary. Check this before assuming
-  the remaining freeze items are only about `DensityField`/`geoContains`
-  cost — it might explain some of item 5's *other* symptoms too, not just
-  the (apparently now-fixed) tab-switch one.
+- **~~Removing a country froze ~10s, then froze again briefly right
+  after~~ / ~~froze long enough to trigger Firefox's "slowing down your
+  browser" warning~~ — FIXED, 2026-08-21.** Real root cause, found by
+  reading the actual `useMemo` deps rather than guessing: `filtered`
+  (the per-country time-range-filtered events object, in the top-level
+  `App` component) was keyed on `activeCountries` — removing any one
+  country invalidated the ENTIRE `filtered` object, rebuilding brand-new
+  event arrays (`.filter().sort()` always returns new array references)
+  for every REMAINING country too, even though their underlying data
+  hadn't changed. Those new references cascaded into every remaining
+  `CountryMapCard`'s own memoization (`projected`, `densityData`,
+  `regionCounts`), forcing the whole per-country pipeline — KDE included
+  — to recompute on a completely unrelated removal.
 
-Likely candidates for the still-open items: the `DensityField`/KDE
-per-point computation, and `geoContains` region-containment checks
-(O(events × regions)) re-running on every country add/remove.
+  Fixed by iterating `Object.keys(data)` instead of `activeCountries`,
+  and dropping `activeCountries` from the deps entirely — `data` already
+  only holds countries that have been loaded and is never pruned on
+  remove, so this trades a little unused memory for a removed-but-
+  previously-loaded country for correctness, nothing else. All 8 call
+  sites already guard with `filtered[id] || []`, so extra inactive keys
+  are harmless.
 
-## 6. Consistent event-list window across all 3 map tabs — NOT STARTED, scope decided 2026-08-21
+  **Verified, not assumed:** live dev app, Chile+Spain, "Último año",
+  Density tab open on both (so real KDE data existed for each) —
+  removing Spain took **656ms** for Chile's density surface to finish
+  re-rendering (44→22 contour paths, correctly dropping only Spain's),
+  not a multi-second freeze.
+
+- **~~Hover tooltip lags behind fast mouse movement, even on a fresh
+  load~~ — FIXED, 2026-08-21.** recharts' `<Tooltip>` defaults to
+  `isAnimationActive={true}` with a ~400ms position/opacity transition.
+  Every chart's data series already had `isAnimationActive={false}` for
+  the same reason; the 8 `<Tooltip>` components themselves never did.
+  Added it to all 8, matching the existing pattern.
+
+- **~~Dashboard gets slower the longer the session runs~~ — FIXED (most
+  likely explanation found and fixed), 2026-08-21.** `cutoff` (`Date.now()
+  - RANGE_MS[range]`) was NOT memoized — recomputed fresh on every `App`
+  render, a new millisecond-precision value nearly every time, regardless
+  of whether `range` actually changed. Since `filtered`'s `useMemo`
+  depends on `cutoff`, this meant ANY App-level state change at all —
+  toggling focus, opening the country picker, anything — forced a full
+  re-filter of every active country's events, cascading into the exact
+  same expensive downstream recompute (KDE, region counts) the
+  `activeCountries` fix above addressed, just triggered by far more than
+  country add/remove. Over a real session with many small interactions,
+  this compounds — a very plausible full explanation for "gets slower
+  the longer the session runs" without needing an actual memory leak.
+  Memoized on `[range]` only.
+
+  **Verified, not assumed:** tagged the live contour-path DOM nodes for
+  Chile (Density open, "Último año"), then toggled focus — an App-level
+  state change unrelated to filtering or range. Chile's contour paths
+  were confirmed to be the exact same DOM nodes afterward, not
+  recreated, proving `densityData` didn't recompute at all for an
+  unrelated interaction.
+
+- **Scrolling feels janky/stepped rather than smooth — INVESTIGATED, no
+  distinct cause found.** Checked for the usual suspects: no global
+  `scroll`/`mousemove` listeners, no `backdrop-filter` usage, only 2
+  `feGaussianBlur` filters in the whole app (both gated behind Density
+  being open for a specific country, not always-present). No dedicated
+  scroll-handling code exists at all — scrolling is native browser
+  behavior here, nothing intercepts it. Given that, and given how much
+  of this session's actual freeze-causing work (KDE recompute, the two
+  cascading-recompute bugs above) was capable of blocking the main
+  thread at effectively random moments — including mid-scroll — it's
+  plausible the "jank" was a symptom of those bugs rather than a
+  separate scroll-specific issue. Not marking this DONE since that's an
+  inference, not something verified the way the other two above were.
+  **Re-test after the fixes above; if it's still janky, this needs real
+  browser profiling tools (Chrome DevTools Performance tab) to find a
+  concrete cause — not available in this environment.**
+- **~~New question raised 2026-08-21~~ — ANSWERED, and partially fixed,
+  2026-08-21.** Checked `useMemo` deps directly rather than guessing:
+  `projection`/`path` (deps `[adm0, W, H]`) and `regionCounts` (deps
+  `[adm1, path, events]`) were already correctly independent of
+  `mapView` — no bug there, tab switching was never recomputing the
+  country outline or region choropleth. **But `DensitySurface`'s KDE grid
+  computation had its own internal `useMemo`, inside a component that
+  only exists while `mapView === "density"`** — every tab switch away
+  unmounted it, and every switch back remounted a fresh instance with no
+  memory of the previous computation, rerunning the whole KDE grid from
+  scratch even with unchanged events. This is almost certainly the actual
+  cause of the original "Density tab freezes on switch" report. Fixed by
+  pulling the computation out into a standalone `computeDensityContours()`
+  function and memoizing it in `CountryMapCard` itself (a `densityData`
+  useMemo, gated by a `densityVisited` flag so it's still not computed
+  until Density is actually opened once) — same pattern `regionCounts`
+  already used successfully. `DensitySurface` is now pure rendering, no
+  computation of its own.
+
+  **Verified, not just assumed:** instrumented the live dev app (Chile +
+  Spain, "Último año" range, ~500+ events) — cold first switch into
+  Density took long enough to exceed a 30s script timeout (confirms the
+  *first* computation is genuinely expensive for a large dataset — a
+  real, separate problem this fix does NOT address, see below), but a
+  second switch away and back rendered the identical 44 contour paths in
+  ~650ms. That's the fix working as intended: it stops the *repeat* cost,
+  it doesn't make the one real computation faster.
+
+  **~~Still open~~ — FIXED, 2026-08-21.** The raw KDE cost for large
+  datasets was real (confirmed above), and likely the actual explanation
+  for the user's original "~1 minute" freeze report, not just the
+  recompute-on-remount bug. Considered capping to the top-N events
+  (globally or per-region) but rejected it — for a seismic tool, silently
+  dropping real events to go faster is a data-integrity problem, and a
+  magnitude-based cut would specifically erase swarm/aftershock
+  clustering (the many-small-events signal a density map exists to show)
+  while leaving isolated big events untouched.
+
+  Instead: `clusterDensityPoints()` bins events into a small fixed grid
+  (independent of the main density grid) before the per-point Gaussian
+  splat — only genuinely close-in-screen-space points merge; isolated/
+  large events pass through untouched. Since the existing combine rule is
+  `max()` not sum, a cluster of near-identical overlapping small events
+  already produced a nearly identical visual result to just its
+  strongest member, so this simplifies already-redundant work rather
+  than cutting real data — every individual event is still shown in
+  bubbles/lists elsewhere.
+
+  **Verified, not assumed:** same live dataset as above (Chile+Spain,
+  "Último año", ~500+ events) — cold first switch dropped from 30+
+  seconds to **~989ms**, with an **identical 44 contour paths** rendered
+  before and after. Same visual output, ~27x faster.
+
+  Remaining, smaller levers (Web Worker offload, coarser grid, capping
+  kernel reach) are no longer needed for this dataset but stay
+  available if a future pathological case (very large, evenly-spread,
+  non-clustered event set) needs them — clustering helps least exactly
+  when data isn't clustered.
+
+(Country removal and tooltip lag are now fixed, documented earlier in
+this section — this stale note originally listed them as candidates
+before that work happened. Only scrolling jank remains genuinely
+unverified.)
+
+## 5b. Real ~1min freeze switching Densidad→Regiones with a high-activity country — FIXED, 2026-08-21
+
+The `geoContains` candidate above turned out to be real — found and
+fixed after the user reported switching Densidad→Regiones with
+Chile+Japan+USA(California) all active took nearly a minute, then
+another minute for USA specifically to finish. `regionCounts`'
+`geoContains()` call is a naive O(events × regions) scan over the
+**full uncapped** event set (deliberately uncapped — a choropleth
+needs accurate counts, see the reasoning already in §6's "Regiones"
+notes about why capping there would break it).
+
+**Measured, not guessed**: downloaded Japan's real "Último año" dataset
+(1314 events via USGS) and its real ADM1 boundaries (47 prefectures),
+timed the actual naive `geoContains` cost in Node: **5545ms for 61758
+point-in-polygon checks, on ONE country.** With Chile and USA computing
+their own `regionCounts` on the same synchronous render, this plausibly
+stacks to the ~1 minute reported.
+
+**Fix**: `geometryBBox()` computes each region's bounding box once (a
+cheap flat coordinate scan — deliberately not through `d3.geoBounds`,
+the function whose ring-winding bug caused the original planet-scale
+map issue, and irrelevant here since a bbox check doesn't care about
+winding direction), then a cheap bbox check runs before the expensive
+`geoContains` ray-cast. Same Japan dataset: **5545ms → 83ms (67x)**,
+only 1.2% of combinations actually needed the real check. Zero accuracy
+cost — every event is still correctly tested.
+
+**Verified in-browser with the user's exact reported scenario recreated
+live** (Chile 549 + Japan 1303 + USA-California 958 real events,
+"Último año", Densidad→Regiones): all 119 region paths across all 3
+countries render correctly, no console errors. Remaining wait is
+legitimate first-time ADM1 network fetch for 3 countries at once
+(cached after first visit per the earlier localStorage fix), not a
+computation freeze.
+
+## 6. Consistent event-list window across all 3 map tabs — DONE, 2026-08-21
+
+New shared `EventListPanel` component in [src/App.jsx](src/App.jsx), used
+identically by all 3 tabs (Density's existing bespoke implementation was
+refactored to use it too, not duplicated):
+
+- **Epicentros**: gets the docked list panel + a legend row (two real
+  differently-sized dots labeled with actual min/max magnitude on the
+  map, not a fake gradient bar — bubbles are sized by magnitude, not
+  colored on a scale, so a literal Regiones/Densidad-style gradient
+  legend would've been meaningless filler).
+- **Regiones**: the region popup is this tab's version of the panel.
+  Defaults collapsed with placeholder copy when nothing's selected;
+  selection is driven by a *pinned* (clicked) region, not hover, so
+  mousing across regions doesn't flicker the panel open/closed. The
+  floating region popup itself was trimmed to name+count only — it used
+  to inline the full list too, which would now show in both places.
+- **Density**: epicenter markers (previously zero interaction) now get
+  the same hover-preview/click-to-open-USGS popup Epicentros' bubbles
+  already have.
+- **Ordering**: `sortEvents()` + one `sortMode` state per country card,
+  shared identically across all 3 panels via two toggle buttons
+  ("Recientes"/"Magnitud") — the user-toggleable design decided above,
+  not a fixed default.
+- **Bonus fix found while testing**: a pinned popup used to linger after
+  switching map tabs (`mapView` wasn't clearing it) — fixed with a
+  `useEffect(() => setPopup(null), [mapView])`.
+
+**Verified in-browser**, not just built: Epicentros panel+legend render
+correctly for both countries; Regiones defaults to the placeholder and
+opens with a real event list on click (tested both a 0-event region and
+a real 4-event one, Andalucía); the Magnitud sort toggle actually
+re-sorts (confirmed descending M5.2→M4.6) and the chosen mode carries
+across tab switches within a session; Density markers show the hover
+popup with place/magnitude/depth/time and a USGS link; switching tabs no
+longer leaves a stale popup behind. No console errors at any step.
+
+**Follow-up fixes, 2026-08-21 (user caught these after testing the above):**
+
+1. Panels defaulted to open (`listCollapsed` started `false`) — fixed to
+   start closed on all 3 tabs, and to stay wherever the user last left
+   them (removed the auto-expand-on-region-click behavior too, for the
+   same reason — it shouldn't reopen on its own).
+2. Clicking a region used to "pin" the floating popup open, so it stuck
+   around on screen alongside the docked panel — both showing the same
+   info at once. Fixed by removing the "pinned" concept entirely (it
+   was never used by bubbles/density markers, only regions) — the
+   floating popup is now a pure hover preview, and region selection for
+   the docked panel is its own separate state (`selectedRegion`).
+3. User reported a 15s freeze switching to "Último año" — could not
+   reproduce it with the (smaller) dataset tested locally. **User then
+   confirmed, correctly, that it's real**: adding Japan (much higher
+   seismic activity) alongside an uncapped Chile caused reaction times
+   over 5s, and the density tab's per-marker "breathe" pulsar CSS
+   animation — hundreds of simultaneously-animating SVG elements —
+   "completely overwhelmed the page." **The list-only cap above (item
+   under §6 follow-ups) was the wrong fix — it never touched what
+   actually renders on the map.** Corrected: `capEventsForMap()`, top-
+   100-by-magnitude (explicit user instruction — test at 100 first,
+   drop to 50 if still too slow), applied once in `CountryMapCard` as
+   `mapEvents`, used for everything the map actually draws (bubbles,
+   density markers + pulsar animation, the Epicentros/Densidad list
+   panel). Does NOT touch `filtered[id]`/period-summary stats/charts
+   (still the true full dataset), and deliberately does NOT touch
+   `regionCounts` (capping to the top-100-strongest nationally would
+   make a region full of small aftershocks look empty, defeating the
+   point of a choropleth — documented inline in the code).
+
+   **Verified in-browser against Chile's real 548-event "Último año"
+   dataset**, not just built: bubble circle count in the DOM confirmed
+   at exactly 100 (was 548); density epicenter markers + pulsar rings
+   both confirmed at 100 for Chile (114 total across both country
+   cards = 100 capped Chile + 14 uncapped Spain); the legend's min/max
+   correctly reads M4.6–M6.9 (the capped set's real range); period-
+   summary stats still show the true 548. No console errors.
+
+   **If 100 is still too slow with a real high-activity country like
+   Japan, per the user's explicit instruction: drop `MAP_EVENT_CAP` to
+   50.** Not yet tested at that lower value — waiting on the user's
+   real-world result once this is deployed.
+
+<details>
+<summary>Original scope note (for history — now implemented as described above)</summary>
 
 Currently only the Density tab has a collapsible event-list panel; the
 other two tabs have nothing (Epicentros) or a legend but no list
@@ -440,14 +664,13 @@ reason:
   the **same hover popup Epicentros' bubbles already have** (place, mag,
   depth, time) — this is new interactive surface for Density, not a
   redesign of the existing list panel.
-- **Ordering must be decided once and applied consistently across all 3
-  tabs' lists** — currently unspecified/accidental (probably just
-  USGS API response order for the existing Density list, never chosen on
-  purpose). Options discussed: most recent first, strongest magnitude
-  first, or nearest-to-viewport-center first. **Needs an explicit decision
-  before implementation** — whatever's chosen affects list-header/hint
-  copy too (e.g. "most recent" vs "largest"), so don't build 3 different
-  orders by accident by copy-pasting without deciding first.
+- **Ordering — DECIDED 2026-08-21: user-toggleable, not a fixed default.**
+  Rejected all three originally-proposed fixed orders (most recent /
+  strongest magnitude / nearest-to-viewport-center) in favor of two
+  simple toggle buttons ("Recientes"/"Magnitud" or similar — exact i18n
+  copy TBD) letting the user pick between chronological and magnitude
+  sort themselves. One shared sort-mode state/control, reused identically
+  across all 3 tabs' lists — not three separate implementations.
 - **Open technical question, check before or during implementation:**
   does `CountryMapCard` recompute the map projection/paths on every
   `mapView` tab switch even though the underlying boundary/projection
@@ -462,7 +685,29 @@ tackle it in disciplined pieces with individual commits per sub-piece
 top of this file) rather than one large uncommitted pass — easier to
 isolate and revert if a specific piece goes wrong.
 
-## 7. GitHub API boundary-fetch caching — NOT STARTED, priority raised 2026-08-21
+</details>
+
+## 7. GitHub API boundary-fetch caching — DONE
+
+Implemented in [src/App.jsx](src/App.jsx) `fetchBoundary()`: resolved
+boundary GeoJSON (post `fixRingWinding`/`fixShapeNames`) is cached in
+localStorage keyed by `boundary-cache-v{BOUNDARY_CACHE_VERSION}-{iso3}-
+{level}`, no TTL. Verified via automated network-request check (not just
+eyeballing): second page load makes zero requests to `geoboundaries.org`
+or any `github.com`/`githubusercontent.com` host, and the map still
+renders correctly from the cached data. `BOUNDARY_CACHE_VERSION` is the
+manual-bust escape hatch — bump it if the fetch/fix pipeline itself ever
+changes and old cached entries need invalidating.
+
+Also resolves the practical cause of item 4 (boundary loading flakiness)
+by construction — repeated add/remove of countries no longer spends
+network requests after the first fetch per country/level, so there's
+much less opportunity to trip GitHub's rate limit at all.
+
+<details>
+<summary>Original scoping note (superseded by the above, kept for context)</summary>
+
+NOT STARTED, priority raised 2026-08-21
 
 Previously logged as a low-priority "nice to have" (see HANDOFF.md). Re-
 scoped upward after clarifying the actual mechanics of GitHub's rate
@@ -500,6 +745,8 @@ limit, discussed 2026-08-21:
 - Related to and likely explains item 4 (boundary loading flakiness) —
   see that section for the connection.
 
+</details>
+
 ---
 
 ## Suggested order of attack
@@ -512,10 +759,9 @@ convention unless told otherwise:
 2. ~~Regions tab legend + click/hover affordance~~ — DONE
 3. ~~Density tab color + rendering approach~~ — DONE
 4. ~~Map fitting~~ — DONE (see corrected §0)
-5. Regions tab (ADM1) boundary lines too thin, esp. Atlas/day theme (§2b)
-   — small, contained, same pattern as the earlier ADM0 outline fix
-6. GitHub API boundary caching (§7) — medium, contained, real user-impact
-   fix, likely also resolves item 4 (boundary loading flakiness)
+5. ~~Regions tab (ADM1) boundary lines too thin, esp. Atlas/day theme~~
+   (§2b) — DONE
+6. ~~GitHub API boundary caching~~ (§7) — DONE
 7. Performance re-verification (§5) — re-check remaining freeze symptoms
    now that tab-switching is confirmed fixed; check the tab-switch
    recompute question while here

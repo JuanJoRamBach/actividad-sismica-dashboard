@@ -14,6 +14,39 @@ import { STRINGS, detectLang } from "./i18n.js";
 
 function usgsEventUrl(eventId) { return `https://earthquake.usgs.gov/earthquakes/eventpage/${eventId}`; }
 
+/* Shared across all 3 map tabs' event lists (Epicentros/Densidad/Regiones) — the */
+/* user explicitly rejected a single fixed default order (most recent / strongest */
+/* magnitude / nearest-to-viewport-center were all considered and turned down) in */
+/* favor of a toggle they control themselves. One function, one set of toggle     */
+/* buttons, reused identically in all three rather than three separate orderings. */
+function sortEvents(events, mode) {
+  const arr = events.slice();
+  if (mode === "magnitude") arr.sort((a, b) => b.mag - a.mag);
+  else arr.sort((a, b) => b.time - a.time);
+  return arr;
+}
+
+/* Caps how many events actually get RENDERED on the map (bubbles, density KDE +  */
+/* markers + the per-marker "breathe" pulsar CSS animation, region containment    */
+/* checks) — not just the sidebar list, which was the wrong place to cap: a       */
+/* high-activity country (Japan) over a long range plus an existing one (Chile)   */
+/* both uncapped meant hundreds to a thousand+ simultaneously-animating SVG       */
+/* elements across 2-3 country cards at once, which is a real, severe cost        */
+/* regardless of how fast any single computation is. Ordered cap, top-100-by-     */
+/* magnitude first (test at 100; drop to 50 if still too slow) — NOT the earlier  */
+/* spatial-clustering approach used for the Density surface's OWN internal grid   */
+/* computation (that stays as-is, it's a different problem: reducing redundant    */
+/* KDE splats for a fixed point set, not reducing how many points/markers exist   */
+/* in the first place). This never touches filtered[id] itself — period-summary   */
+/* stats, charts, and Epicentros' own magnitude/count figures elsewhere in the    */
+/* app still reflect the TRUE full dataset; only what CountryMapCard renders is   */
+/* capped.                                                                        */
+const MAP_EVENT_CAP = 100;
+function capEventsForMap(events, cap) {
+  if (events.length <= cap) return events;
+  return events.slice().sort((a, b) => b.mag - a.mag).slice(0, cap);
+}
+
 const EARTH_RADIUS_KM = 6371;
 /* Great-circle destination point, given a start point, distance, and bearing  */
 /* (standard spherical formula) — used to measure "how many pixels is N km,    */
@@ -241,7 +274,38 @@ function fixShapeNames(gj) {
   return gj;
 }
 
+/* Country/region borders essentially never change, and GitHub's unauthenticated  */
+/* API is rate-limited per CALLING IP across ALL of api.github.com — not per-app  */
+/* — so every uncached fetch here spends a slice of a real visitor's shared quota */
+/* on something that didn't need to change. Cache the fully-processed result     */
+/* (post fixRingWinding/fixShapeNames) in localStorage indefinitely; no TTL, since*/
+/* guessing a "correct" expiry is worse than just bumping BOUNDARY_CACHE_VERSION  */
+/* by hand if the fetch/fix pipeline itself ever changes and old cached entries   */
+/* need invalidating. Failure to read/write the cache is never fatal — it's a     */
+/* nice-to-have, not a requirement, so every localStorage call is wrapped.        */
+const BOUNDARY_CACHE_VERSION = 1;
+const boundaryCacheKey = (iso3, level) => `boundary-cache-v${BOUNDARY_CACHE_VERSION}-${iso3}-${level}`;
+
+function readBoundaryCache(iso3, level) {
+  try {
+    const raw = localStorage.getItem(boundaryCacheKey(iso3, level));
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeBoundaryCache(iso3, level, gj) {
+  try {
+    localStorage.setItem(boundaryCacheKey(iso3, level), JSON.stringify(gj));
+  } catch {
+    /* localStorage full, disabled, or unavailable (private browsing) — ignore. */
+  }
+}
+
 async function fetchBoundary(iso3, level) {
+  const cached = readBoundaryCache(iso3, level);
+  if (cached) return cached;
   const metaRes = await fetch(`https://www.geoboundaries.org/api/current/gbOpen/${iso3}/${level}/`);
   if (!metaRes.ok) throw new Error("meta");
   const meta = await metaRes.json();
@@ -258,7 +322,9 @@ async function fetchBoundary(iso3, level) {
   const geomRes = await fetch(finalUrl);
   if (!geomRes.ok) throw new Error("geom");
   const gj = await geomRes.json();
-  return fixRingWinding(fixShapeNames(gj));
+  const fixed = fixRingWinding(fixShapeNames(gj));
+  writeBoundaryCache(iso3, level, fixed);
+  return fixed;
 }
 
 /* geoBoundaries' ADM0 files ship with every disjoint ring (mainland, each island)  */
@@ -303,6 +369,23 @@ function mainlandRing(gj) {
     });
   });
   return best ? { type: "Feature", properties: {}, geometry: { type: "Polygon", coordinates: best } } : null;
+}
+
+/* [minX, minY, maxX, maxY] of a Polygon/MultiPolygon geometry — used as a cheap  */
+/* pre-filter in front of the expensive geoContains() ray-cast (see regionCounts  */
+/* in CountryMapCard). A plain flat coordinate scan, deliberately not going       */
+/* through d3.geoBounds — that's the same function whose backwards-ring-winding   */
+/* interpretation caused the original planet-scale map bug, and it's not needed   */
+/* here anyway since a bbox check doesn't care about a ring's winding direction.  */
+function geometryBBox(geometry) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  const walk = (coords, depth) => {
+    if (depth === 0) { const [x, y] = coords; if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y; return; }
+    coords.forEach((c) => walk(c, depth - 1));
+  };
+  const depth = geometry.type === "Polygon" ? 2 : geometry.type === "MultiPolygon" ? 3 : -1;
+  if (depth >= 0) walk(geometry.coordinates, depth);
+  return [minX, minY, maxX, maxY];
 }
 
 /* ---------------------------------------------------------------------- */
@@ -467,12 +550,48 @@ function AlertTooltip({ active, payload }) {
 /* with densityRamp() (the Density surface's own violet/magenta palette, see   */
 /* the token comment near its definition) so band-to-band steps are real       */
 /* computed intensity, not visual noise from overlapping shapes.               */
-function DensitySurface({ pts, w, h }) {
-  const C = React.useContext(ThemeContext);
-  const cellPx = 3;
-  const { contours, padCells } = useMemo(() => {
-    if (pts.length < 1) return { contours: [], padCells: 0 };
-    const maxR = Math.max(20, ...pts.map((p) => p.r || 20));
+/* Pulled out of DensitySurface so CountryMapCard can memoize it at ITS OWN      */
+/* level (see densityData there) instead of DensitySurface's own useMemo, which */
+/* only lives as long as DensitySurface stays mounted — since it's only mounted */
+/* while mapView === "density", switching tabs away and back was unmounting and */
+/* remounting it, throwing away the memo and recomputing this whole KDE grid    */
+/* from scratch every single time, even with unchanged events. That's the real  */
+/* cause of the "Density tab freezes on switch" symptom — regionCounts doesn't  */
+/* have this problem because it already lives in CountryMapCard directly.       */
+/* Pre-clusters events close enough their Gaussians would heavily overlap anyway  */
+/* under the max()-combine rule below — a tight swarm of many small events        */
+/* (aftershock sequences are exactly this) otherwise costs one full splat per      */
+/* individual point even though max() means their combined contribution is        */
+/* visually near-identical to just the strongest one among them once they         */
+/* overlap that much. Binning to a small FIXED grid (independent of the main      */
+/* density grid, and not scaled per point) only merges points that are genuinely  */
+/* close in screen space — an isolated/large event rarely shares a bin with       */
+/* anything and comes through untouched. This cuts computational point count      */
+/* roughly in proportion to how clustered the real data is, without dropping a    */
+/* single real event from the underlying data: bubbles/lists elsewhere still show */
+/* every individual event, only this internal density-estimation step simplifies. */
+function clusterDensityPoints(pts) {
+  const binPx = 6;
+  const bins = new Map();
+  pts.forEach((p) => {
+    const key = `${Math.round(p.x / binPx)},${Math.round(p.y / binPx)}`;
+    const existing = bins.get(key);
+    if (!existing) { bins.set(key, { x: p.x, y: p.y, r: p.r, w: p.w, n: 1, sx: p.x, sy: p.y }); return; }
+    existing.n += 1;
+    existing.sx += p.x; existing.sy += p.y;
+    existing.x = existing.sx / existing.n; existing.y = existing.sy / existing.n;
+    existing.r = Math.max(existing.r, p.r);
+    existing.w = Math.max(existing.w, p.w);
+  });
+  return Array.from(bins.values());
+}
+
+const DENSITY_CELL_PX = 3;
+function computeDensityContours(rawPts, w, h) {
+  const cellPx = DENSITY_CELL_PX;
+  if (rawPts.length < 1) return { contours: [], padCells: 0 };
+  const pts = clusterDensityPoints(rawPts);
+  const maxR = Math.max(20, ...pts.map((p) => p.r || 20));
     /* Same reasoning as before: pad past any single point's own kernel reach so */
     /* it fades near-zero before the true edge, instead of getting hard-cut.     */
     const padCells = Math.ceil((maxR * 2.5) / cellPx);
@@ -557,8 +676,15 @@ function DensitySurface({ pts, w, h }) {
     const thresholds = Array.from({ length: levels }, (_, i) => maxVal * (0.5 - 0.5 * Math.cos(Math.PI * (i + 1) / levels)));
     const cs = d3contours().size([gridW, gridH]).thresholds(thresholds)(grid);
     return { contours: cs, padCells };
-  }, [pts, w, h]);
+}
 
+/* Pure rendering — no computation here. contours/padCells now come in as props, */
+/* computed once by CountryMapCard's own densityData useMemo (see there) so this */
+/* component's own mount/unmount lifecycle (tied to mapView === "density") can't */
+/* throw the expensive part away. See computeDensityContours() above for why.    */
+function DensitySurface({ contours, padCells, w, h }) {
+  const C = React.useContext(ThemeContext);
+  const cellPx = DENSITY_CELL_PX;
   if (!contours.length) return null;
   const contourPath = geoPath();
   const uid = `${Math.round(w)}-${Math.round(h)}`;
@@ -670,6 +796,105 @@ function regionColor(C, v, max) {
 }
 
 
+/* Shared docked list panel — same component, same position/sizing/styling, used  */
+/* by all 3 map tabs so switching between them doesn't change the card's height   */
+/* or jump the layout around. title/count/events vary per tab (Regiones passes    */
+/* the currently-selected region's own list; Epicentros/Densidad pass every event */
+/* currently on the map); the sort toggle and collapse behavior are identical     */
+/* everywhere, not three separate implementations of the same idea.               */
+/* A country like Chile/Japan/Indonesia over "Último año" can have 500+ events —  */
+/* nobody wants to scroll a 130px box through that many, and it's a real DOM-node */
+/* cost for no benefit once you're well past what anyone will actually scroll to. */
+/* Capped, not hidden silently: shows exactly how many are cut off, and the cap   */
+/* applies AFTER sorting, so "top 100 by magnitude" or "100 most recent" is still */
+/* the true top 100 — this only trims the list widget, never the map itself      */
+/* (bubbles/density still render every real event, this is a display-only cap).  */
+const EVENT_LIST_DISPLAY_CAP = 100;
+
+function EventListPanel({ id, C, t, title, count, totalCount, events, collapsed, onToggleCollapse, sortMode, onSortChange, emptyText, hint, onEventClick, forceCollapsed, placeholderHint }) {
+  const isCollapsed = collapsed;
+  const sorted = useMemo(() => sortEvents(events, sortMode), [events, sortMode]);
+  const visible = sorted.length > EVENT_LIST_DISPLAY_CAP ? sorted.slice(0, EVENT_LIST_DISPLAY_CAP) : sorted;
+  return (
+    <div style={{
+      position: "absolute", left: 8, bottom: 8, width: 200,
+      display: "flex", flexDirection: "column", background: C.surface, border: `1px solid ${C.surfaceBorder}`,
+      borderRadius: 10, boxShadow: `0 8px 24px ${C.surfaceShadow}`, zIndex: 4, overflow: "hidden",
+    }}>
+      <button onClick={onToggleCollapse} disabled={!onToggleCollapse}
+        aria-label={isCollapsed ? t.epicenterListExpand : t.epicenterListCollapse}
+        style={{
+          display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%",
+          padding: "8px 10px", background: "none", border: "none", cursor: onToggleCollapse ? "pointer" : "default", textAlign: "left",
+        }}>
+        <span style={{ fontSize: 10, fontWeight: 600, letterSpacing: 0.4, textTransform: "uppercase", color: C.textDim }}>
+          {title}{count !== null && count !== undefined ? ` · ${count}` : ""}
+        </span>
+        {onToggleCollapse && <span style={{ color: C.textFaint, fontSize: 16, lineHeight: 1 }}>{isCollapsed ? "▸" : "▾"}</span>}
+      </button>
+      {/* forceCollapsed (e.g. Regiones with no region picked yet) always shows its   */}
+      {/* placeholder hint even though there's no list/toggle — a real "nothing to    */}
+      {/* show yet" state, distinct from the user manually collapsing a real list.    */}
+      {forceCollapsed && placeholderHint && (
+        <div style={{ fontSize: 10.5, color: C.textFaint, padding: "0 10px 12px" }}>{placeholderHint}</div>
+      )}
+      {!forceCollapsed && !isCollapsed && (
+        sorted.length > 0 ? (
+          <>
+            <div style={{ display: "flex", gap: 4, padding: "0 10px 5px" }}>
+              {/* Solid C.bloodRed, not the selected-tab bloodRed->rose gradient — same red    */
+              /* family, but at this size (9px text) the gradient's lighter "rose" end        */
+              /* only just clears WCAG AAA in crimson (7.08:1) and misses it in atlas          */
+              /* (5.81:1). Solid bloodRed + white text computes to 8.9-10:1 in both themes,    */
+              /* verified, not eyeballed — comfortably AAA regardless of theme.               */}
+              {[["time", t.sortByTime], ["magnitude", t.sortByMagnitude]].map(([mode, label]) => (
+                <button key={mode} onClick={() => onSortChange(mode)}
+                  style={{
+                    fontSize: 9, padding: "2px 7px", borderRadius: 999, cursor: "pointer",
+                    border: `1px solid ${sortMode === mode ? C.bloodRed : C.surfaceBorder}`,
+                    background: sortMode === mode ? C.bloodRed : "none",
+                    color: sortMode === mode ? "#fff" : C.textFaint,
+                  }}>{label}</button>
+              ))}
+            </div>
+            {hint && <div style={{ fontSize: 9, color: C.textFaint, padding: "0 10px 5px" }}>{hint}</div>}
+            <div style={{ height: 130, overflowY: "auto", padding: "0 6px 8px", display: "flex", flexDirection: "column", gap: 1 }}>
+              {visible.map((p, i) => (
+                <button key={p.id || i} onClick={() => onEventClick(p)}
+                  style={{ display: "block", textAlign: "left", background: "none", border: "none", cursor: "pointer", borderRadius: 6, padding: "5px 4px", width: "100%" }}
+                  onMouseEnter={(ev) => { ev.currentTarget.style.background = withAlpha(C.text, 0.06); }}
+                  onMouseLeave={(ev) => { ev.currentTarget.style.background = "transparent"; }}>
+                  <div style={{ fontSize: 10.5, color: C.text, lineHeight: 1.3 }}>{p.place}</div>
+                  <div style={{ fontSize: 9.5, color: C.textDim }}>
+                    M <b style={{ color: C.dotRed }}>{p.mag}</b>{p.time ? ` · ${fmtLocalTime(p.time, id, "es")}` : ""}
+                  </div>
+                </button>
+              ))}
+            </div>
+            {/* totalCount is set when the MAP itself is already capped upstream         */}
+            {/* (capEventsForMap, top-100-strongest) — show that as "strongest of N"      */}
+            {/* rather than the generic list-only truncation note, since that's the       */}
+            {/* actually-true reason fewer than the full count are shown here. Falls back */}
+            {/* to the plain list-only cap (Regiones, which isn't capped upstream) when    */}
+            {/* totalCount isn't provided.                                                */}
+            {totalCount !== undefined && totalCount > count ? (
+              <div style={{ fontSize: 9, color: C.textFaint, padding: "0 10px 8px", fontStyle: "italic" }}>
+                {t.epicenterListCappedByMagnitude(count, totalCount)}
+              </div>
+            ) : sorted.length > EVENT_LIST_DISPLAY_CAP && (
+              <div style={{ fontSize: 9, color: C.textFaint, padding: "0 10px 8px", fontStyle: "italic" }}>
+                {t.epicenterListTruncated(EVENT_LIST_DISPLAY_CAP, sorted.length)}
+              </div>
+            )}
+          </>
+        ) : (
+          <div style={{ fontSize: 10.5, color: C.textFaint, padding: "0 10px 12px" }}>{emptyText}</div>
+        )
+      )}
+    </div>
+  );
+}
+
 /* ---------------------------------------------------------------------- */
 /* Sección de mapa unificada — Epicentros / Densidad / Regiones           */
 /* Usa geoBoundaries en vivo (ADM0 para el contorno, ADM1 para regiones)  */
@@ -684,7 +909,15 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
   const [adm1, setAdm1] = useState(null);
   const [adm1Status, setAdm1Status] = useState("idle");
   const [popup, setPopup] = useState(null);
-  const [listCollapsed, setListCollapsed] = useState(false);
+  /* A pinned region/event popup used to linger visually after switching tabs      */
+  /* (mapView didn't clear it) — a stale "Región X selected" popup floating over   */
+  /* the Density surface makes no sense once you've left the Regions tab.         */
+  useEffect(() => { setPopup(null); }, [mapView]);
+  /* Closed by default on all 3 tabs — the panel opening on its own (whether on   */
+  /* first mount or from a click) was flagged as wrong; it should stay exactly    */
+  /* where the user last left it, closed until THEY choose to open it.           */
+  const [listCollapsed, setListCollapsed] = useState(true);
+  const [sortMode, setSortMode] = useState("time");
   const svgRef = useRef(null);
   const zoomBehaviorRef = useRef(null);
   const [transform, setTransform] = useState(zoomIdentity);
@@ -791,9 +1024,15 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
 
   const path = useMemo(() => (projection ? geoPath(projection) : null), [projection]);
 
+  /* Ordered cap (see capEventsForMap above) — everything the map actually renders */
+  /* (bubbles, density markers/pulsar, region containment) uses this capped set,   */
+  /* not the raw events prop. Period-summary stats/charts elsewhere in the app     */
+  /* still use the true filtered[id] directly, unaffected.                        */
+  const mapEvents = useMemo(() => capEventsForMap(events, MAP_EVENT_CAP), [events]);
+
   const projected = useMemo(() => {
     if (!projection) return [];
-    return events.map((e) => {
+    return mapEvents.map((e) => {
       const p = projection([e.lon, e.lat]);
       if (!p) return null;
       /* Felt-radius in real km, converted to THIS projection's pixels by       */
@@ -804,19 +1043,68 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
       const radiusPx = edge ? Math.hypot(edge[0] - p[0], edge[1] - p[1]) : 20;
       return { ...e, x: p[0] + 8, y: p[1] + 8, radiusPx };
     }).filter(Boolean);
-  }, [projection, events]);
+  }, [projection, mapEvents]);
 
-  const maxMag = Math.max(1, ...events.map((e) => e.mag));
+  const maxMag = Math.max(1, ...mapEvents.map((e) => e.mag));
 
+  /* Same "compute once, keep across tab switches" fix as regionCounts below —   */
+  /* densityVisited mirrors what adm1 does for Regions: adm1 only gets populated */
+  /* once the Regions tab's fetch effect actually runs, so regionCounts' useMemo */
+  /* naturally skips the expensive work until then, and is never thrown away by  */
+  /* a tab switch since it lives here, not inside a conditionally-mounted child. */
+  /* Density has no fetch to gate on (it's pure client-side computation from     */
+  /* events already in hand), so a plain "have we ever shown this tab" flag      */
+  /* does the same job.                                                         */
+  const [densityVisited, setDensityVisited] = useState(mapView === "density");
+  useEffect(() => { if (mapView === "density") setDensityVisited(true); }, [mapView]);
+
+  const densityPts = useMemo(() =>
+    projected.map((p) => ({ x: p.x, y: p.y, r: p.radiusPx, w: p.mag / maxMag })),
+    [projected, maxMag]);
+
+  const densityData = useMemo(() => {
+    if (!densityVisited) return { contours: [], padCells: 0 };
+    return computeDensityContours(densityPts, W - 16, H - 16);
+  }, [densityVisited, densityPts, W, H]);
+
+  /* Deliberately the FULL events here, not the capped mapEvents — a choropleth's  */
+  /* whole point is showing accurate regional distribution, and capping to the    */
+  /* top-100-strongest nationally would make a region full of small aftershocks   */
+  /* look empty just because none of them individually crack the national top     */
+  /* 100. The per-region event LIST (via the docked panel) still has its own      */
+  /* separate, smaller safety-net cap (EVENT_LIST_DISPLAY_CAP) if a single region */
+  /* somehow has 100+ events of its own, which is far less likely than a whole    */
+  /* country doing so.                                                            */
+  /* Cheap bbox check before the expensive geoContains() ray-cast — most events    */
+  /* aren't anywhere near most regions, so a bbox reject avoids the costly check    */
+  /* almost entirely. Measured on Japan's real "Último año" dataset (1314 events,   */
+  /* 47 prefectures, 61758 combinations): 5545ms naive -> 83ms with this filter,    */
+  /* only 1.2% of combinations actually needed the real geoContains call. This is   */
+  /* very likely what was behind the near-1-minute freeze switching into Regiones   */
+  /* with a high-activity country active — the FULL uncapped event set is kept     */
+  /* (see the comment above about why capping this would break the choropleth),    */
+  /* this only makes the SAME correct computation faster, no accuracy tradeoff.    */
   const regionCounts = useMemo(() => {
     if (!adm1 || !path) return null;
     return adm1.features.map((f) => {
-      const regionEvents = events.filter((e) => geoContains(f, [e.lon, e.lat]));
+      const [minX, minY, maxX, maxY] = geometryBBox(f.geometry);
+      const regionEvents = events.filter((e) => {
+        if (e.lon < minX || e.lon > maxX || e.lat < minY || e.lat > maxY) return false;
+        return geoContains(f, [e.lon, e.lat]);
+      });
       const c = path.centroid(f);
       return { feature: f, count: regionEvents.length, events: regionEvents, d: path(f), cx: c[0] + 8, cy: c[1] + 8 };
     });
   }, [adm1, events, path]);
   const maxRegionCount = regionCounts ? Math.max(1, ...regionCounts.map((r) => r.count)) : 1;
+  /* Its own state, deliberately NOT derived from the hover popup — a click used to */
+  /* "pin" the floating popup open (stick around after the mouse left), which the   */
+  /* user correctly flagged as wrong: hover should ONLY ever show the small         */
+  /* floating card, and clicking should ONLY ever affect the docked list panel      */
+  /* below, never leave the floating card stuck on screen. So there's no more       */
+  /* "pinned" concept at all — the floating popup is purely a hover preview now,    */
+  /* and region selection (which drives the docked panel) is tracked separately.   */
+  const [selectedRegion, setSelectedRegion] = useState(null);
 
   if (adm0Status === "loading") {
     return <div style={{ height: H * 0.5, display: "flex", alignItems: "center", justifyContent: "center", color: C.textFaint, fontSize: 12.5 }}>{t.loadingBoundary}</div>;
@@ -832,8 +1120,7 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
   return (
     <div style={{ position: "relative" }}>
       <div style={{ position: "relative" }}>
-      <svg ref={attachZoom} viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: cssHeight, background: "rgba(128,128,128,0.04)", borderRadius: 10, touchAction: "none", cursor: k > 1.001 ? "grab" : "default" }}
-        onClick={() => setPopup((p) => (p && p.pinned ? null : p))}>
+      <svg ref={attachZoom} viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: cssHeight, background: "rgba(128,128,128,0.04)", borderRadius: 10, touchAction: "none", cursor: k > 1.001 ? "grab" : "default" }}>
         <g transform="translate(8,8)">
           <g transform={transform.toString()}>
             {mapView === "regions" && regionCounts && regionCounts.map((r, i) => {
@@ -843,9 +1130,9 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
                 <path key={i} d={r.d} fill={regionColor(C, r.count, maxRegionCount)}
                   stroke={isHovered ? C.text : withAlpha(C.text, 0.15)} strokeWidth={(isHovered ? 1.4 : 0.5) / k}
                   style={{ cursor: "pointer" }}
-                  onMouseEnter={() => { if (!(popup && popup.pinned)) setPopup({ kind: "region", region: { name, count: r.count, events: r.events }, x: r.cx, y: r.cy, pinned: false }); }}
-                  onMouseLeave={() => setPopup((pp) => (pp && pp.pinned ? pp : null))}
-                  onClick={(ev) => { ev.stopPropagation(); setPopup({ kind: "region", region: { name, count: r.count, events: r.events }, x: r.cx, y: r.cy, pinned: true }); }} />
+                  onMouseEnter={() => setPopup({ kind: "region", region: { name, count: r.count, events: r.events }, x: r.cx, y: r.cy })}
+                  onMouseLeave={() => setPopup(null)}
+                  onClick={(ev) => { ev.stopPropagation(); setSelectedRegion({ name, count: r.count, events: r.events }); }} />
               );
             })}
             {mapView === "regions" && adm1Status === "loading" && (
@@ -859,14 +1146,14 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
               return (
                 <circle key={i} cx={p.x} cy={p.y} r={r} fill={C.dotRed} fillOpacity={0.85} stroke={withAlpha(C.bg, 0.6)} strokeWidth={0.6 / k}
                   style={{ cursor: "pointer" }}
-                  onMouseEnter={() => setPopup((pp) => (pp && pp.pinned ? pp : { kind: "event", event: p, x: p.x, y: p.y, pinned: false }))}
-                  onMouseLeave={() => setPopup((pp) => (pp && pp.pinned ? pp : null))}
+                  onMouseEnter={() => setPopup({ kind: "event", event: p, x: p.x, y: p.y })}
+                  onMouseLeave={() => setPopup(null)}
                   onClick={(ev) => { ev.stopPropagation(); if (p.id) window.open(usgsEventUrl(p.id), "_blank", "noopener,noreferrer"); }} />
               );
             })}
             {mapView === "density" && (
               <>
-                <DensitySurface pts={projected.map((p) => ({ x: p.x, y: p.y, r: p.radiusPx, w: p.mag / maxMag }))} w={W - 16} h={H - 16} />
+                <DensitySurface contours={densityData.contours} padCells={densityData.padCells} w={W - 16} h={H - 16} />
                 {/* A weak/isolated event on a large, elongated map (Chile: same physical  */}
                 {/* felt-radius in km projects to fewer pixels than on a compact country's  */}
                 {/* map, since the projection's pixels-per-km ratio is smaller) can render  */}
@@ -897,14 +1184,21 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
                     <stop offset="100%" stopColor={C.epicenterEdge} stopOpacity="0" />
                   </radialGradient>
                 </defs>
+                {/* Same hover-preview / click-to-open popup as the Epicentros bubbles — this  */}
+                {/* previously had no interaction at all. Only on the primary dot, not the     */}
+                {/* pulse ring (pointerEvents: none there) so hover doesn't double-fire.        */}
                 {projected.map((p, i) => (
                   <circle key={`ep-${i}`} cx={p.x} cy={p.y} r={Math.min(3.2, Math.max(1.5, (p.radiusPx || 20) * 0.055))}
-                    fill={`url(#epicenter-${id})`} stroke={C.text} strokeWidth={0.5 / k} strokeOpacity={0.5} />
+                    fill={`url(#epicenter-${id})`} stroke={C.text} strokeWidth={0.5 / k} strokeOpacity={0.5}
+                    style={{ cursor: "pointer" }}
+                    onMouseEnter={() => setPopup({ kind: "event", event: p, x: p.x, y: p.y })}
+                    onMouseLeave={() => setPopup(null)}
+                    onClick={(ev) => { ev.stopPropagation(); if (p.id) window.open(usgsEventUrl(p.id), "_blank", "noopener,noreferrer"); }} />
                 ))}
                 {projected.map((p, i) => (
                   <circle key={`pulse-${i}`} className="liveDot" cx={p.x} cy={p.y} r={3.5 / k}
                     fill="none" stroke={C.epicenterCore} strokeWidth={0.9 / k} strokeOpacity={0.6}
-                    style={{ transformBox: "fill-box", transformOrigin: "center" }} />
+                    style={{ transformBox: "fill-box", transformOrigin: "center", pointerEvents: "none" }} />
                 ))}
               </>
             )}
@@ -924,27 +1218,16 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
           top: `${((8 + transform.applyY(popup.y)) / H) * 100}%`,
           transform: "translate(-50%, -115%)", background: C.surface, border: `1px solid ${C.surfaceBorder}`,
           borderRadius: 10, padding: "10px 12px", minWidth: 190, maxWidth: 260, boxShadow: `0 8px 24px ${C.surfaceShadow}`, zIndex: 5,
-          pointerEvents: popup.pinned ? "auto" : "none",
+          pointerEvents: "none",
         }}>
-          {popup.pinned && <button onClick={() => setPopup(null)} aria-label="Close" style={{ position: "absolute", top: 4, right: 6, background: "none", border: "none", color: C.textFaint, fontSize: 14, cursor: "pointer", lineHeight: 1 }}>×</button>}
           {popup.kind === "region" ? (
-            <>
-              <div style={{ fontSize: 12.5, color: C.text, fontWeight: 600, paddingRight: 14 }}>{popup.region.name}</div>
-              <div style={{ fontSize: 11.5, color: C.textDim, marginTop: 2, marginBottom: popup.pinned && popup.region.events.length ? 6 : 0 }}>{t.regionEventsCount(popup.region.count)}</div>
-              {popup.pinned && popup.region.events.length > 0 && (
-                <div style={{ maxHeight: 170, overflowY: "auto", display: "flex", flexDirection: "column", gap: 7, borderTop: `1px solid ${C.surfaceBorder}`, paddingTop: 6 }}>
-                  {popup.region.events.map((e) => (
-                    <a key={e.id} href={usgsEventUrl(e.id)} target="_blank" rel="noopener noreferrer"
-                      style={{ display: "block", textDecoration: "none", color: "inherit" }}>
-                      <div style={{ fontSize: 11, color: C.text }}>{e.place}</div>
-                      <div style={{ fontSize: 10.5, color: C.textDim }}>
-                        M <b style={{ color: C.dotRed }}>{e.mag}</b> · {e.depth} km{e.time ? ` · ${fmtLocalTime(e.time, id, "es")}` : ""}
-                      </div>
-                    </a>
-                  ))}
-                </div>
-              )}
-            </>
+            /* Just name + count here — the full event list lives in the docked   */
+            /* EventListPanel below now (see "the region popup BECOMES this tab's */
+            /* version of the panel" in PLAN.md §6), not duplicated in both.      */
+            <div style={{ fontSize: 12.5, color: C.text, fontWeight: 600, paddingRight: 14 }}>
+              {popup.region.name}
+              <div style={{ fontSize: 11.5, color: C.textDim, fontWeight: 400, marginTop: 2 }}>{t.regionEventsCount(popup.region.count)}</div>
+            </div>
           ) : (
             <>
               <div style={{ fontSize: 12.5, color: C.text, fontWeight: 600, paddingRight: 14 }}>{popup.event.place}</div>
@@ -963,48 +1246,39 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
           )}
         </div>
       )}
-      {mapView === "density" && (
-        <div style={{
-          position: "absolute", left: 8, bottom: 8, width: 200,
-          display: "flex", flexDirection: "column", background: C.surface, border: `1px solid ${C.surfaceBorder}`,
-          borderRadius: 10, boxShadow: `0 8px 24px ${C.surfaceShadow}`, zIndex: 4, overflow: "hidden",
-        }}>
-          <button onClick={() => setListCollapsed((v) => !v)}
-            aria-label={listCollapsed ? t.epicenterListExpand : t.epicenterListCollapse}
-            style={{
-              display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%",
-              padding: "8px 10px", background: "none", border: "none", cursor: "pointer", textAlign: "left",
-            }}>
-            <span style={{ fontSize: 10, fontWeight: 600, letterSpacing: 0.4, textTransform: "uppercase", color: C.textDim }}>
-              {t.epicenterListTitle} · {projected.length}
-            </span>
-            <span style={{ color: C.textFaint, fontSize: 16, lineHeight: 1 }}>{listCollapsed ? "▸" : "▾"}</span>
-          </button>
-          {!listCollapsed && (
-            projected.length > 0 ? (
-              <>
-                <div style={{ fontSize: 9, color: C.textFaint, padding: "0 10px 5px" }}>{t.epicenterListHint}</div>
-                <div style={{ height: 130, overflowY: "auto", padding: "0 6px 8px", display: "flex", flexDirection: "column", gap: 1 }}>
-                  {projected.map((p, i) => (
-                    <button key={p.id || i} onClick={() => zoomToEvent(p)}
-                      style={{ display: "block", textAlign: "left", background: "none", border: "none", cursor: "pointer", borderRadius: 6, padding: "5px 4px", width: "100%" }}
-                      onMouseEnter={(ev) => { ev.currentTarget.style.background = withAlpha(C.text, 0.06); }}
-                      onMouseLeave={(ev) => { ev.currentTarget.style.background = "transparent"; }}>
-                      <div style={{ fontSize: 10.5, color: C.text, lineHeight: 1.3 }}>{p.place}</div>
-                      <div style={{ fontSize: 9.5, color: C.textDim }}>
-                        M <b style={{ color: C.dotRed }}>{p.mag}</b>{p.time ? ` · ${fmtLocalTime(p.time, id, "es")}` : ""}
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              </>
-            ) : (
-              <div style={{ fontSize: 10.5, color: C.textFaint, padding: "0 10px 12px" }}>{t.epicenterListEmpty}</div>
-            )
-          )}
-        </div>
+      {(mapView === "density" || mapView === "bubbles") && (
+        <EventListPanel id={id} C={C} t={t}
+          title={t.epicenterListTitle} count={projected.length} totalCount={events.length} events={projected}
+          collapsed={listCollapsed} onToggleCollapse={() => setListCollapsed((v) => !v)}
+          sortMode={sortMode} onSortChange={setSortMode}
+          emptyText={t.epicenterListEmpty} hint={t.epicenterListHint} onEventClick={zoomToEvent} />
+      )}
+      {mapView === "regions" && (
+        <EventListPanel id={id} C={C} t={t}
+          title={selectedRegion ? selectedRegion.name : t.regionListTitlePlaceholder}
+          count={selectedRegion ? selectedRegion.count : null} events={selectedRegion ? selectedRegion.events : []}
+          collapsed={listCollapsed} onToggleCollapse={selectedRegion ? () => setListCollapsed((v) => !v) : undefined}
+          forceCollapsed={!selectedRegion} placeholderHint={t.regionListPlaceholderHint}
+          sortMode={sortMode} onSortChange={setSortMode}
+          emptyText={t.epicenterListEmpty} hint={t.epicenterListHint}
+          onEventClick={zoomToEvent} />
       )}
       </div>
+      {mapView === "bubbles" && (
+        /* Bubbles are sized by magnitude, not colored on a gradient, so a literal   */
+        /* gradient-bar legend (like Regiones/Densidad below) wouldn't mean anything */
+        /* here — two actual differently-sized dots showing the real min/max         */
+        /* magnitude on this map is the honest equivalent, not a filler row just to  */
+        /* match height. Row height still matches the other two legends so switching */
+        /* tabs doesn't change the card's total height.                             */
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8, fontSize: 11, color: C.textDim }}>
+          <span>{t.bubblesLegendLabel}</span>
+          <span style={{ width: 4, height: 4, borderRadius: "50%", background: C.dotRed, flexShrink: 0 }} />
+          <span>M{mapEvents.length ? Math.min(...mapEvents.map((e) => e.mag)).toFixed(1) : "–"}</span>
+          <span style={{ width: 9, height: 9, borderRadius: "50%", background: C.dotRed, flexShrink: 0 }} />
+          <span>M{mapEvents.length ? maxMag.toFixed(1) : "–"}</span>
+        </div>
+      )}
       {mapView === "regions" && regionCounts && (
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8, fontSize: 11, color: C.textDim }}>
           <span>{t.regionLegendLabel}</span>
@@ -1150,14 +1424,37 @@ export default function App() {
 
   useEffect(() => { if (!visibleCountries.includes(magTab) && magTab !== "comparacion") setMagTab(visibleCountries[0]); }, [visibleCountries.join(","), magTab]);
 
-  const cutoff = Date.now() - RANGE_MS[range];
+  /* Memoized on [range] only — NOT recomputed fresh every render. It used to be a  */
+  /* plain `Date.now() - RANGE_MS[range]`, which produced a new value on nearly     */
+  /* every render (different millisecond timestamp) regardless of whether `range`   */
+  /* actually changed. Since filtered's useMemo depends on cutoff, that meant ANY   */
+  /* App-level state change at all — toggling focus, opening the country picker,    */
+  /* anything — forced a full re-filter of every active country's events and        */
+  /* cascaded into the same expensive downstream recompute (KDE, region counts)     */
+  /* the activeCountries fix above addressed, just triggered more broadly. This is  */
+  /* the likely explanation for "the dashboard gets slower the longer the session   */
+  /* runs" — every interaction anywhere adds to that cost, not just map-specific    */
+  /* actions.                                                                       */
+  const cutoff = useMemo(() => Date.now() - RANGE_MS[range], [range]);
   const granularity = range === "day" ? "hour" : range === "year" ? "week" : "day";
 
+  /* Deliberately NOT keyed on activeCountries: filtering over Object.keys(data)   */
+  /* instead means adding/removing a country never invalidates the filtered arrays */
+  /* for every OTHER already-loaded country. It used to be keyed on activeCountries,*/
+  /* which meant removing one country rebuilt brand-new event arrays for every      */
+  /* remaining one (even though their underlying data hadn't changed) — those new   */
+  /* references then cascaded into CountryMapCard's own memoization (projected,     */
+  /* densityData, regionCounts), forcing the whole per-country pipeline, KDE        */
+  /* included, to recompute on a completely unrelated removal. That's the real      */
+  /* cause of "removing a country freezes the page." data[] itself already only     */
+  /* holds countries that have been loaded (via handleAdd's load(id)) and is never  */
+  /* pruned on remove, so this costs a little unused memory for a removed-but-      */
+  /* still-loaded country, not extra fetches or recomputation elsewhere.            */
   const filtered = useMemo(() => {
     const out = {};
-    activeCountries.forEach((id) => { out[id] = (data[id] || []).filter((e) => e.time >= cutoff).sort((a, b) => a.time - b.time); });
+    Object.keys(data).forEach((id) => { out[id] = (data[id] || []).filter((e) => e.time >= cutoff).sort((a, b) => a.time - b.time); });
     return out;
-  }, [data, cutoff, activeCountries]);
+  }, [data, cutoff]);
 
   const lineData = (id) => (filtered[id] || []).map((e) => ({ x: e.time, mag: e.mag, place: e.place }));
 
@@ -1332,7 +1629,7 @@ export default function App() {
                           <CartesianGrid stroke={C.grid} vertical={false} />
                           <XAxis dataKey="x" type="number" domain={["dataMin", "dataMax"]} tickFormatter={(v) => fmtAxisTime(v, granularity, lang)} stroke={C.textFaint} fontSize={11} />
                           <YAxis domain={[0, "dataMax + 1"]} stroke={C.textFaint} fontSize={11} />
-                          <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} labelFormatter={(v) => fmtLocalTime(v, id, lang)} formatter={(v) => [v, t.magAxis]} />
+                          <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} labelFormatter={(v) => fmtLocalTime(v, id, lang)} formatter={(v) => [v, t.magAxis]} isAnimationActive={false} />
                           <Line type="monotone" dataKey="mag" stroke={colorFor(id)} strokeWidth={2.8} dot={false} isAnimationActive={false} />
                         </LineChart>
                       </ResponsiveContainer>
@@ -1352,7 +1649,7 @@ export default function App() {
                         <CartesianGrid stroke={C.grid} vertical={false} />
                         <XAxis dataKey="x" type="number" domain={["dataMin", "dataMax"]} tickFormatter={(v) => fmtAxisTime(v, granularity, lang)} stroke={C.textFaint} fontSize={11} />
                         <YAxis stroke={C.textFaint} fontSize={11} />
-                        <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} labelFormatter={(v) => fmtAxisTime(v, granularity, lang)} />
+                        <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} labelFormatter={(v) => fmtAxisTime(v, granularity, lang)} isAnimationActive={false} />
                         <Legend wrapperStyle={{ fontSize: 12 }} formatter={(v) => countryLabel(v, lang) || v} />
                         {visibleCountries.map((id) => <Area key={id} type="monotone" dataKey={id} stroke={colorFor(id)} strokeWidth={2.5} fill={`url(#gradD-${id})`} isAnimationActive={false} />)}
                       </AreaChart>
@@ -1372,7 +1669,7 @@ export default function App() {
                         <CartesianGrid stroke={C.grid} vertical={false} />
                         <XAxis dataKey="x" type="number" domain={["dataMin", "dataMax"]} tickFormatter={(v) => fmtAxisTime(v, granularity, lang)} stroke={C.textFaint} fontSize={11} />
                         <YAxis domain={[0, "dataMax + 1"]} stroke={C.textFaint} fontSize={11} />
-                        <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} labelFormatter={(v) => fmtLocalTime(v, magTab || visibleCountries[0], lang)} formatter={(v) => [v, t.magAxis]} />
+                        <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} labelFormatter={(v) => fmtLocalTime(v, magTab || visibleCountries[0], lang)} formatter={(v) => [v, t.magAxis]} isAnimationActive={false} />
                         <Line type="monotone" dataKey="mag" stroke={colorFor(magTab || visibleCountries[0])} strokeWidth={2.8} dot={false} isAnimationActive={false} />
                       </LineChart>
                     </ResponsiveContainer>
@@ -1388,7 +1685,7 @@ export default function App() {
                         <CartesianGrid stroke={C.grid} vertical={false} />
                         <XAxis dataKey="x" type="number" domain={["dataMin", "dataMax"]} tickFormatter={(v) => fmtAxisTime(v, granularity, lang)} stroke={C.textFaint} fontSize={11} />
                         <YAxis stroke={C.textFaint} fontSize={11} />
-                        <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} labelFormatter={(v) => fmtAxisTime(v, granularity, lang)} />
+                        <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} labelFormatter={(v) => fmtAxisTime(v, granularity, lang)} isAnimationActive={false} />
                         <Legend wrapperStyle={{ fontSize: 12 }} formatter={(v) => countryLabel(v, lang) || v} />
                         {visibleCountries.map((id) => <Area key={id} type="monotone" dataKey={id} stroke={colorFor(id)} strokeWidth={2.5} fill={`url(#gradM-${id})`} isAnimationActive={false} />)}
                       </AreaChart>
@@ -1404,7 +1701,7 @@ export default function App() {
                   <CartesianGrid stroke={C.grid} vertical={false} />
                   <XAxis dataKey="x" type="number" domain={["dataMin", "dataMax"]} tickFormatter={(v) => fmtAxisTime(v, granularity, lang)} stroke={C.textFaint} fontSize={11} />
                   <YAxis stroke={C.textFaint} fontSize={11} />
-                  <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} labelFormatter={(v) => fmtAxisTime(v, granularity, lang)} />
+                  <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} labelFormatter={(v) => fmtAxisTime(v, granularity, lang)} isAnimationActive={false} />
                   <Legend wrapperStyle={{ fontSize: 12 }} formatter={(v) => countryLabel(v, lang) || v} />
                   {visibleCountries.map((id) => <Line key={id} type="stepAfter" dataKey={id} stroke={colorFor(id)} strokeWidth={2.8} dot={false} isAnimationActive={false} />)}
                 </LineChart>
@@ -1419,7 +1716,7 @@ export default function App() {
                   <CartesianGrid stroke={C.grid} vertical={false} />
                   <XAxis dataKey="bin" stroke={C.textFaint} fontSize={11} />
                   <YAxis stroke={C.textFaint} fontSize={11} />
-                  <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} />
+                  <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} isAnimationActive={false} />
                   <Legend wrapperStyle={{ fontSize: 12 }} formatter={(v) => countryLabel(v, lang) || v} />
                   {visibleCountries.map((id) => <Bar key={id} dataKey={id} fill={colorFor(id)} radius={[4, 4, 0, 0]} isAnimationActive={false} />)}
                 </BarChart>
@@ -1435,7 +1732,7 @@ export default function App() {
                       <XAxis dataKey="depth" name={t.depthAxis} unit=" km" stroke={C.textFaint} fontSize={11} />
                       <YAxis dataKey="mag" name={t.magAxis} stroke={C.textFaint} fontSize={11} />
                       <ZAxis range={[30, 30]} />
-                      <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} cursor={{ stroke: C.textFaint }} formatter={(v, n) => [v, n === "depth" ? `${t.depthAxis} (km)` : t.magAxis]} />
+                      <Tooltip contentStyle={tooltipStyle} itemStyle={tooltipItemStyle} cursor={{ stroke: C.textFaint }} formatter={(v, n) => [v, n === "depth" ? `${t.depthAxis} (km)` : t.magAxis]} isAnimationActive={false} />
                       <Scatter data={depthScatter(id)} isAnimationActive={false}>
                         {depthScatter(id).map((e, i) => <Cell key={i} fill={ALERT_COLOR[e.alert]} fillOpacity={0.85} />)}
                       </Scatter>
@@ -1458,7 +1755,7 @@ export default function App() {
                       <Pie data={alertBreakdown(id)} dataKey="value" nameKey="name" innerRadius={52} outerRadius={80} paddingAngle={2} isAnimationActive={false}>
                         {alertBreakdown(id).map((e, i) => <Cell key={i} fill={ALERT_COLOR[e.key]} />)}
                       </Pie>
-                      <Tooltip content={<AlertTooltip />} />
+                      <Tooltip content={<AlertTooltip />} isAnimationActive={false} />
                       <Legend wrapperStyle={{ fontSize: 12 }} />
                     </PieChart>
                   </ResponsiveContainer>
