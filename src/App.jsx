@@ -1195,11 +1195,22 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
                     onMouseLeave={() => setPopup(null)}
                     onClick={(ev) => { ev.stopPropagation(); if (p.id) window.open(usgsEventUrl(p.id), "_blank", "noopener,noreferrer"); }} />
                 ))}
-                {projected.map((p, i) => (
-                  <circle key={`pulse-${i}`} className="liveDot" cx={p.x} cy={p.y} r={3.5 / k}
-                    fill="none" stroke={C.epicenterCore} strokeWidth={0.9 / k} strokeOpacity={0.6}
-                    style={{ transformBox: "fill-box", transformOrigin: "center", pointerEvents: "none" }} />
-                ))}
+                {/* Only the hovered marker pulses, not all of them — up to 100 events per   */}
+                {/* country meant up to 100 (or 300 with 3 countries active) simultaneously   */}
+                {/* CSS-animating rings, a real, confirmed compositor cost even with GPU-      */}
+                {/* friendly opacity/transform properties, just from sheer animated-layer      */}
+                {/* count. Reference equality against popup.event works because it's the      */}
+                {/* exact same object set by this marker's own onMouseEnter below, from the    */}
+                {/* same (memoized, so stable) projected array.                               */}
+                {popup && popup.kind === "event" && (() => {
+                  const p = projected.find((ev) => ev === popup.event);
+                  if (!p) return null;
+                  return (
+                    <circle className="liveDot" cx={p.x} cy={p.y} r={3.5 / k}
+                      fill="none" stroke={C.epicenterCore} strokeWidth={0.9 / k} strokeOpacity={0.6}
+                      style={{ transformBox: "fill-box", transformOrigin: "center", pointerEvents: "none" }} />
+                  );
+                })()}
               </>
             )}
           </g>
