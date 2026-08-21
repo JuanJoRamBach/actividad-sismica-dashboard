@@ -167,11 +167,11 @@ once the branches are merged.
 ## 3. Density tab — visual design and color — DONE
 
 This one went through a LOT of iteration (color scheme alone changed maybe
-six times) before landing. Full blow-by-blow is in the conversation log if
-ever needed, but don't re-read it to "fix" the current colors — the palette
-below is the user's own explicit final direction, arrived at by them
-directly specifying hex values after several rejected proposals. Only change
-it if asked.
+six times) before landing, and then a SECOND full rework on 2026-08-21 (see
+below) once the user clarified what "properly done" actually meant. Full
+blow-by-blow is in the conversation log if ever needed, but don't re-read it
+to "fix" the current technique/colors without being asked — both are the
+user's own explicit, now-validated final direction.
 
 ### Technique (stable since early on, not what kept changing)
 
@@ -350,6 +350,97 @@ in mind before touching marker rendering again:
   *higher* exponent (settled on 6) combined with an opacity ceiling
   (`Math.pow(t, 6) * 0.65`) is what actually reads as more transparent —
   it's lower than the original curve at every t < 1, not just at the peak.
+  **Superseded 2026-08-21 — see below.** This exponent-6/0.65-ceiling
+  curve was specifically tuned for a "soft glow, only the hot core is
+  solid" aesthetic. Once the goal changed to a real multi-tier contour
+  look, this same curve became the actual bug (see below) — it wasn't
+  wrong when written, the *goal* changed out from under it.
+
+### 2026-08-21 rework — true accumulation, 5-stop palette, real contour tiers
+
+**Branch:** `fix/density-heatmap-rework` (not yet merged as of this
+writing). User showed real reference images (a Warsaw KDE heatmap, a
+Phoenix Maptitude store-density heatmap, and a metaball/organic-blob
+example) and asked for the actual underlying technique those tools use —
+not a re-skin of the existing glow. Three real problems were found and
+fixed in sequence, each one only visible once the previous was fixed:
+
+1. **Wrong combine function.** `max()` (deliberately chosen originally
+   to avoid a different problem — see the untouched surrounding history
+   above) structurally cannot produce two epicenters' fields visibly
+   connecting/brightening where they overlap, since it only ever shows
+   whichever point is locally strongest, never their sum. Switched grid
+   combine to SUM, with kernel width widened back to 0.45× (from 0.35×,
+   which was tightened specifically to prevent bridging under the old
+   max()-combine — now bridging is the point). To stop a dense swarm
+   from summing to one flat saturated blob (the exact failure mode that
+   justified max() in the first place), the accumulated grid is
+   compressed via `sqrt` before thresholding — monotonic, so relative
+   internal texture within a cluster is fully preserved, it just tames
+   how fast values climb with more overlap. Color/alpha normalization
+   was also switched from a fixed ceiling of 1 to this render's own
+   `maxVal`, required for "more concentrated = brighter" to be visible
+   at all (a fixed ceiling would clip any real accumulation back down to
+   the same "hottest" color as a lone event).
+
+   **Verified with a controlled synthetic test** (faithful
+   reimplementation of the real splat/combine/compress logic, sampled
+   at known points): two points 30px apart show a bridge at their
+   midpoint reaching 71% of a single point's own peak; two points 200px
+   apart show exactly 0 at the midpoint (correctly no bridge when far
+   apart); three tightly-clustered points peak 71% brighter than one
+   isolated point alone.
+
+2. **New 5-stop `densityStops` palette**, replacing the old 3-stop red/
+   pink-only version, per explicit request for "4 to 5 colors" — a
+   genuine cool→hot ramp, not a re-tint of the old family:
+   - crimson: `#16215C → #1D5FA0 → #1C9A82 → #E8A23A → #FFA88F`,
+     verified monotonic INCREASING lightness (15→39→57→72→77), correct
+     direction for a near-black background.
+   - atlas: `#A8C8E8 → #4C86B8 → #1F8A6B → #A85F1A → #7A0F14`, verified
+     monotonic DECREASING lightness (79→54→51→48→26), matching this
+     project's existing pale→dark convention for light themes.
+   `multiColorRamp()` added for N-stop HCL interpolation (`colorRamp()`,
+   the original 3-stop version, is untouched and still used by
+   Regiones, which keeps its own separate palette on purpose).
+
+3. **Wrong band structure — the one that actually took two attempts to
+   get right.** First fix after switching to sum/compress kept the OLD
+   22-level cosine-eased thresholds and OLD `pow(t,6)*0.65` alpha curve
+   unchanged. User feedback: "I don't really see the other colors, and
+   they have a Halo somehow... it's just a stain." Root cause, verified
+   numerically (accounting for how nested bands actually composite —
+   effective opacity = 1 − product(1−alpha) across every band a point
+   clears): that curve gave ~1.6% effective opacity at t=0.5, ~8% at
+   t=0.7 — everything except a sliver near the true peak was invisible.
+   First attempted fix (`0.025 + pow(t,1.1)*0.11`, tuned against the
+   same composited-opacity math) fixed the invisibility but produced a
+   NEW, different problem: user feedback "so much worse than before...
+   doesn't have the organicness of those graphs" — one smooth blended
+   blob instead of distinct rings, because it kept the fundamental
+   "many thin overlapping bands stack into visibility" MODEL, just with
+   different numbers. That model can only ever look smooth — stacking
+   translucent layers *is* a blur operation, no amount of retuning the
+   specific alpha values changes that. Real contour plots look tiered
+   because each band is mostly OPAQUE and paints over what's beneath it,
+   so the topmost (highest, smallest-area) band wins outright at each
+   point instead of blending with everything below it.
+
+   **Actual fix:** levels 22 → 7, threshold spacing switched from
+   cosine-ease (deliberately smooth) to plain linear (deliberately
+   stepped), alpha curve rewritten to `0.35 + pow(t,1.3)*0.55` so each
+   of the 7 bands carries real weight on its own (range ~39%–90%) rather
+   than relying on stacking with neighbors.
+
+   **User-confirmed working, against real data, not just a synthetic
+   test cluster:** a tight 3-event cluster in Spain showed a soft,
+   readable blob; Chile's full "Último año" dataset (genuinely spread-
+   out, real fault-line geography) showed multiple distinct hotspot
+   cores connecting/bridging where close and fading cleanly where not —
+   user's exact words: "Image 2 is beautiful." This is the real
+   validation the synthetic test alone couldn't provide — the synthetic
+   test proved the *math* does what's intended; this proved it actually
+   *looks* like what was intended against real, irregular data.
 
 ## 4. Boundary loading flakiness — LIKELY EXPLAINED, needs the fix in §7
 
