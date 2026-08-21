@@ -93,7 +93,14 @@ const THEMES = {
     text: "#EDEAE7", textDim: "#9C9591", textFaint: "#84807B",
     bloodRed: "#8B0000", rose: "#A92424", dotRed: "#FF6B4C",
     regionLow: "#3A0A0A", regionMid: "#B2231F", regionHigh: "#FF1F8F",
-    densityLow: "#3A0A0A", densityMid: "#B2231F", densityHigh: "#FF1F8F",
+    /* 5-stop cool->hot ramp, replacing the old 3-stop red/pink-only density       */
+    /* palette — verified monotonic INCREASING lightness (15->39->57->72->77),    */
+    /* correct direction for a near-black background (low density blends toward   */
+    /* bg, high density stands out brightest). Hot end is a lighter coral rather   */
+    /* than a fully-saturated red specifically because pure saturated reds/pinks  */
+    /* cap out around L~57-64 in HCL — desaturating slightly was the only way to  */
+    /* keep climbing lightness at the hot end without breaking monotonicity.      */
+    densityStops: ["#16215C", "#1D5FA0", "#1C9A82", "#E8A23A", "#FFA88F"],
     epicenterCore: "#FFD200", epicenterEdge: "#FFD200",
     alertGreen: "#3FD17A", alertYellow: "#D8B93A", alertOrange: "#E0722A", alertRed: "#8B0000", alertNone: "#8C8680",
     palette: ["#2DD8C9", "#B860F5", "#E8A23A"], cardTint: "rgba(255,255,255,0.012)", glowAlpha: [0.28, 0.10],
@@ -105,7 +112,12 @@ const THEMES = {
     text: "#241F1A", textDim: "#5C5346", textFaint: "#655D4D",
     bloodRed: "#8B2318", rose: "#A8481F", dotRed: "#6B3A56",
     regionLow: "#2A1608", regionMid: "#A8481F", regionHigh: "#E8B23A",
-    densityLow: "#C9A6E8", densityMid: "#8B3DC9", densityHigh: "#3B0066",
+    /* Same 5-stop cool->hot family as crimson, verified monotonic DECREASING     */
+    /* lightness (79->54->51->48->26) — correct direction for a light cream       */
+    /* background, matching this project's existing convention that atlas ramps   */
+    /* run pale->dark while crimson ramps run dark->light (see the earlier         */
+    /* "Atlas legend read backwards" fix for why the direction matters).          */
+    densityStops: ["#A8C8E8", "#4C86B8", "#1F8A6B", "#A85F1A", "#7A0F14"],
     epicenterCore: "#FF007F", epicenterEdge: "#FF8000",
     alertGreen: "#2F6B38", alertYellow: "#8C6D1F", alertOrange: "#A34E1C", alertRed: "#8B2318", alertNone: "#9C9187",
     palette: ["#2E4374", "#A8481F", "#7A6624"], cardTint: "rgba(36,31,26,0.035)", glowAlpha: [0.07, 0.04],
@@ -598,29 +610,23 @@ function computeDensityContours(rawPts, w, h) {
     const nx = Math.max(1, Math.ceil(w / cellPx)), ny = Math.max(1, Math.ceil(h / cellPx));
     const gridW = nx + padCells * 2, gridH = ny + padCells * 2;
     const grid = new Float64Array(gridW * gridH);
-    /* Max, not screen-blend, not a plain sum: screen-blend was meant to stop a    */
-    /* tight cluster's stacked peak from dwarfing an isolated event elsewhere —    */
-    /* but it has a side effect nothing here was accounting for. Screen-blending   */
-    /* several overlapping points doesn't just raise the PEAK, it inflates values  */
-    /* toward that ceiling across the whole SHARED area between them — for a      */
-    /* 4-point cluster, that's most of the cluster's footprint, not just its       */
-    /* center. That's what was making the glow look "solid all the way to the     */
-    /* edge" no matter how the alpha curve on top of it was tuned: the input was   */
-    /* already artificially flat over a wide area. max() keeps each point's own   */
-    /* natural Gaussian falloff intact — a real Gaussian IS already steep away     */
-    /* from its own center — and isolated-vs-cluster visibility is now handled    */
-    /* by the fixed-ceiling normalization below instead, not by inflating values.  */
+    /* SUM, not max — reversed on explicit request (2026-08-21): two epicenters     */
+    /* close together should visibly connect, brightening where their fields        */
+    /* overlap, like water mixing or a metaball/neuron-bridge effect — max() can't   */
+    /* produce that structurally, it only ever shows whichever single point is       */
+    /* locally strongest, never their combination. The earlier max()-based version   */
+    /* existed specifically because a naive uncapped sum blew a tight cluster out    */
+    /* to one flat saturated blob with no internal shape (documented below at the    */
+    /* compression step) — the fix for THAT problem is compressing the accumulated   */
+    /* value afterward, not avoiding accumulation altogether.                        */
     pts.forEach((p) => {
-      /* Tighter kernel (0.35, was 0.45) — a tight cluster like Granada's four        */
-      /* events needs each one's OWN footprint narrow enough that they can still      */
-      /* read as separate bumps instead of one immediate merge into a single blob.    */
-      const sigmaPx = Math.max(3, (p.r || 20) * 0.35);
+      /* Widened back toward the original 0.45 (was tightened to 0.35 specifically   */
+      /* to stop bridging under max()-combine, which read as an unwanted "instant    */
+      /* merge" back then). Now that bridging between close points is the explicit   */
+      /* goal, a narrower kernel would prevent the visible connecting bridge from     */
+      /* forming between moderately-close (not just touching) events.                */
+      const sigmaPx = Math.max(3, (p.r || 20) * 0.45);
       const sigmaCells = sigmaPx / cellPx;
-      /* High enough that a single strong isolated event reaches near-full on its    */
-      /* own (color/alpha are normalized against a FIXED ceiling now, not this map's */
-      /* own max — see below — so an isolated event needs to genuinely get close to  */
-      /* that fixed ceiling by itself to read as "solid," not just relatively close  */
-      /* to whatever the strongest thing elsewhere on the map happens to be).        */
       const weight = Math.min(0.9, 0.55 + (p.w || 0) * 0.35);
       const cx = p.x / cellPx + padCells, cy = p.y / cellPx + padCells;
       const reach = Math.ceil(sigmaCells * 3);
@@ -633,11 +639,21 @@ function computeDensityContours(rawPts, w, h) {
         for (let gx = x0; gx <= x1; gx++) {
           const dx = gx - cx;
           const contribution = weight * Math.exp(-(dx * dx + dy * dy) / denom);
-          const idx = rowOff + gx;
-          if (contribution > grid[idx]) grid[idx] = contribution;
+          grid[rowOff + gx] += contribution;
         }
       }
     });
+    /* Compress the accumulated field (sqrt, i.e. gamma=0.5) so a genuinely dense    */
+    /* swarm still reads as brighter than a lone event — satisfying "the more        */
+    /* concentrated, the brighter" — WITHOUT the naive-sum failure mode: raw linear   */
+    /* addition across a 20-event swarm would push that whole area to many multiples */
+    /* of a single point's peak, and since color/alpha map against this render's OWN  */
+    /* max (below), that swarm would fill nearly its whole footprint at max intensity */
+    /* with no visible internal shape left — the same "flat solid blob" problem the   */
+    /* original max()-only version was built to avoid. sqrt is monotonic (relative    */
+    /* ordering — and therefore the internal texture within a cluster — is fully      */
+    /* preserved), it just tames how fast the value climbs as more events overlap.    */
+    for (let i = 0; i < grid.length; i++) grid[i] = Math.sqrt(grid[i]);
     /* Many thresholds (not the earlier 8) so bands step in fine enough           */
     /* increments to read as a smooth continuous gradient rather than visible     */
     /* rings — this is the "blend more" fix; it's a resolution knob, not a       */
@@ -650,7 +666,7 @@ function computeDensityContours(rawPts, w, h) {
     /* thresholds ourselves, strictly greater than 0, avoids that entirely.      */
     let maxVal = 0;
     for (let i = 0; i < grid.length; i++) if (grid[i] > maxVal) maxVal = grid[i];
-    if (maxVal <= 0) return { contours: [], padCells };
+    if (maxVal <= 0) return { contours: [], padCells, maxVal: 0 };
     /* Threshold spacing is sqrt-scaled (gamma < 1), not linear: a big magnitude   */
     /* event's peak sets maxVal, and a much weaker/isolated event's own peak might */
     /* only be a small fraction of that. Evenly-LINEAR thresholds from 0 to maxVal */
@@ -675,14 +691,14 @@ function computeDensityContours(rawPts, w, h) {
     const levels = 22;
     const thresholds = Array.from({ length: levels }, (_, i) => maxVal * (0.5 - 0.5 * Math.cos(Math.PI * (i + 1) / levels)));
     const cs = d3contours().size([gridW, gridH]).thresholds(thresholds)(grid);
-    return { contours: cs, padCells };
+    return { contours: cs, padCells, maxVal };
 }
 
 /* Pure rendering — no computation here. contours/padCells now come in as props, */
 /* computed once by CountryMapCard's own densityData useMemo (see there) so this */
 /* component's own mount/unmount lifecycle (tied to mapView === "density") can't */
 /* throw the expensive part away. See computeDensityContours() above for why.    */
-function DensitySurface({ contours, padCells, w, h }) {
+function DensitySurface({ contours, padCells, maxVal, w, h }) {
   const C = React.useContext(ThemeContext);
   const cellPx = DENSITY_CELL_PX;
   if (!contours.length) return null;
@@ -734,17 +750,16 @@ function DensitySurface({ contours, padCells, w, h }) {
       <g clipPath={`url(#${clipId})`} mask={`url(#${maskId})`} filter={`url(#${smoothId})`}>
         <g transform={`translate(${-padPx},${-padPx}) scale(${cellPx})`}>
           {contours.map((c, i) => {
-            /* Fixed ceiling (1), not this map's own empirical max: dividing by the max */
-            /* VALUE ACTUALLY PRESENT meant a single isolated event got compared to     */
-            /* whatever the strongest thing on the whole map reached — a tight, heavily */
-            /* overlapping cluster elsewhere could inflate that reference so much that   */
-            /* the isolated event, despite being a completely real, legitimate quake,    */
-            /* rounds down to nearly invisible. Grid values are bounded to [0,1] by      */
-            /* construction (max() of per-point weights, each already capped <=0.9), so  */
-            /* comparing against a flat 1 gives every event a consistent, map-independent */
-            /* scale — an isolated event's visibility no longer depends on what else is   */
-            /* on the map.                                                               */
-            const t = Math.min(1, c.value);
+            /* Normalized against THIS RENDER'S OWN maxVal now, not a fixed ceiling —      */
+            /* deliberately reversed from the old fixed-ceiling design (2026-08-21): the    */
+            /* whole point of switching the grid combine from max() to a compressed sum      */
+            /* (see computeDensityContours) was to make "more concentrated = visibly         */
+            /* brighter" actually show up. A fixed ceiling of 1 would have defeated that —    */
+            /* a genuinely dense cluster's compressed sum can exceed what any single point    */
+            /* alone reaches, and comparing it against a flat 1 (rather than the map's own    */
+            /* peak) would clip everything above that ceiling to the same "hottest" color,     */
+            /* losing exactly the differentiation this change exists to create.               */
+            const t = maxVal > 0 ? Math.min(1, c.value / maxVal) : 0;
             /* Steeper exponent (6, not 4.5) — a lower exponent raises MID-range opacity     */
             /* even while the peak stays capped, which is what made an earlier attempt at    */
             /* "more transparent" here (exponent 3) actually look more overbearing, not      */
@@ -778,16 +793,31 @@ function withAlpha(hex, a) { const { r, g, b } = hexToRgb(hex); return `rgba(${r
 /* - regionLow/Mid/High: the Regions choropleth's own palette (dark red/brown  */
 /*   -> escalating red/orange -> hot pink/gold) — this is the original ramp    */
 /*   from before the Density rework and should stay that way unless asked.     */
-/* - densityLow/Mid/High: the Density surface's own violet/magenta palette,    */
-/*   the user's explicit final call after several rejected proposals.         */
+/* - densityStops: the Density surface's own 5-stop cool->hot palette, superseding */
+/*   the earlier 3-stop violet/magenta-only version at the user's explicit request */
+/*   for a richer ramp (referencing real KDE/metaball heatmap tools) once true      */
+/*   accumulation (see computeDensityContours) made a wider range of values worth   */
+/*   distinguishing.                                                               */
 function colorRamp(low, mid, high, t) {
   const tc = Math.min(1, Math.max(0, t));
   const lo = interpolateHcl(low, mid);
   const hi = interpolateHcl(mid, high);
   return tc < 0.5 ? lo(tc / 0.5) : hi((tc - 0.5) / 0.5);
 }
+/* N-stop version of colorRamp above, for densityStops (5 colors) instead of a     */
+/* fixed low/mid/high triple — walks the segment the given t falls into and         */
+/* interpolates in HCL within just that segment, same equal-perceptual-step         */
+/* reasoning as colorRamp.                                                          */
+function multiColorRamp(stops, t) {
+  const tc = Math.min(1, Math.max(0, t));
+  const segments = stops.length - 1;
+  const scaled = tc * segments;
+  const i = Math.min(segments - 1, Math.floor(scaled));
+  const localT = scaled - i;
+  return interpolateHcl(stops[i], stops[i + 1])(localT);
+}
 function densityRamp(C, t) {
-  return colorRamp(C.densityLow, C.densityMid, C.densityHigh, t);
+  return multiColorRamp(C.densityStops, t);
 }
 function regionColor(C, v, max) {
   const t = Math.min(1, v / max);
@@ -1063,7 +1093,7 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
     [projected, maxMag]);
 
   const densityData = useMemo(() => {
-    if (!densityVisited) return { contours: [], padCells: 0 };
+    if (!densityVisited) return { contours: [], padCells: 0, maxVal: 0 };
     return computeDensityContours(densityPts, W - 16, H - 16);
   }, [densityVisited, densityPts, W, H]);
 
@@ -1153,7 +1183,7 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
             })}
             {mapView === "density" && (
               <>
-                <DensitySurface contours={densityData.contours} padCells={densityData.padCells} w={W - 16} h={H - 16} />
+                <DensitySurface contours={densityData.contours} padCells={densityData.padCells} maxVal={densityData.maxVal} w={W - 16} h={H - 16} />
                 {/* A weak/isolated event on a large, elongated map (Chile: same physical  */}
                 {/* felt-radius in km projects to fewer pixels than on a compact country's  */}
                 {/* map, since the projection's pixels-per-km ratio is smaller) can render  */}
@@ -1302,7 +1332,7 @@ function CountryMapCard({ id, events, mapView, rowHeight }) {
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8, fontSize: 11, color: C.textDim }}>
           <span>{t.densityLegendLabel}</span>
           <span>{t.densityLegendLow}</span>
-          <div style={{ flex: 1, maxWidth: 140, height: 8, borderRadius: 4, background: `linear-gradient(90deg, ${C.densityLow}, ${C.densityMid}, ${C.densityHigh})` }} />
+          <div style={{ flex: 1, maxWidth: 140, height: 8, borderRadius: 4, background: `linear-gradient(90deg, ${C.densityStops.join(", ")})` }} />
           <span>{t.densityLegendHigh}</span>
         </div>
       )}
