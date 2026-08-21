@@ -654,42 +654,24 @@ function computeDensityContours(rawPts, w, h) {
     /* ordering — and therefore the internal texture within a cluster — is fully      */
     /* preserved), it just tames how fast the value climbs as more events overlap.    */
     for (let i = 0; i < grid.length; i++) grid[i] = Math.sqrt(grid[i]);
-    /* Many thresholds (not the earlier 8) so bands step in fine enough           */
-    /* increments to read as a smooth continuous gradient rather than visible     */
-    /* rings — this is the "blend more" fix; it's a resolution knob, not a       */
-    /* different technique.                                                      */
-    /* Explicit threshold VALUES, not a bare count: passing a count lets d3      */
-    /* auto-pick "nice" round numbers across [min,max], and since most of this   */
-    /* grid is untouched exact 0 (nothing splatted there), that nice-number      */
-    /* sequence can include 0 itself — a "density >= 0" contour is true          */
-    /* everywhere, so it fills the ENTIRE grid as one solid block. Building the  */
-    /* thresholds ourselves, strictly greater than 0, avoids that entirely.      */
     let maxVal = 0;
     for (let i = 0; i < grid.length; i++) if (grid[i] > maxVal) maxVal = grid[i];
     if (maxVal <= 0) return { contours: [], padCells, maxVal: 0 };
-    /* Threshold spacing is sqrt-scaled (gamma < 1), not linear: a big magnitude   */
-    /* event's peak sets maxVal, and a much weaker/isolated event's own peak might */
-    /* only be a small fraction of that. Evenly-LINEAR thresholds from 0 to maxVal */
-    /* would then cross that weak event's whole range in just 1-2 steps — it reads */
-    /* as a single flat-colored disc with no internal gradient, and its edge just  */
-    /* disappears rather than fading. Packing more thresholds into the low end     */
-    /* gives every event, strong or weak, enough bands to show a real soft falloff */
-    /* — this is the "make them blend and fade" fix.                              */
-    /* Also needs fine resolution at the HIGH end (near t=1) — that's where        */
-    /* densityColor() blends to yellow, and a Gaussian is flattest right at its    */
-    /* own peak, so without enough thresholds there, only one or two huge bands    */
-    /* cover that whole region and yellow ends up covering way more area than      */
-    /* intended. A cosine ease (dense at both ends, sparse in the middle, where    */
-    /* the extra resolution isn't needed) covers both cases with one formula.      */
-    /* Fewer bands, not more: every contour band is a NESTED shape painted over the */
-    /* ones below it, and even a low-alpha band still adds SOME opacity wherever it */
-    /* covers — with dozens of bands all overlapping at any given point, that       */
-    /* stacks into much higher effective opacity than any single band's alpha       */
-    /* value suggests (compositing N thin layers approaches 1-(1-a)^N, not just a). */
-    /* That's what made moderate-density areas stay "bright" despite a steep alpha  */
-    /* curve — more thresholds didn't mean smoother, it meant more compounding.     */
-    const levels = 22;
-    const thresholds = Array.from({ length: levels }, (_, i) => maxVal * (0.5 - 0.5 * Math.cos(Math.PI * (i + 1) / levels)));
+    /* REPLACED a 22-level cosine-eased threshold set (2026-08-21) — that design was  */
+    /* explicitly built (see the old comment this replaced) to make bands "step in    */
+    /* fine enough increments to read as a smooth continuous gradient rather than      */
+    /* visible rings". That was exactly right for the OLD glow aesthetic, and exactly  */
+    /* wrong for this one: the user wants distinct visible tiers, like a real filled   */
+    /* contour/KDE plot — dozens of thin overlapping bands can only ever look like a   */
+    /* single soft blob, no matter how their individual alpha values are tuned,        */
+    /* because that's what stacking many translucent layers fundamentally produces.    */
+    /* A real contour plot's tiers are visually distinct because each band is mostly   */
+    /* OPAQUE and simply paints over whatever's beneath it — the topmost (highest-      */
+    /* threshold, smallest-area) band you see at any point is what determines its      */
+    /* color, not a blend of everything below it. Few levels + high per-band alpha     */
+    /* (see the alpha curve in DensitySurface) is what actually achieves that.         */
+    const levels = 7;
+    const thresholds = Array.from({ length: levels }, (_, i) => maxVal * (i + 1) / levels);
     const cs = d3contours().size([gridW, gridH]).thresholds(thresholds)(grid);
     return { contours: cs, padCells, maxVal };
 }
@@ -760,21 +742,18 @@ function DensitySurface({ contours, padCells, maxVal, w, h }) {
             /* peak) would clip everything above that ceiling to the same "hottest" color,     */
             /* losing exactly the differentiation this change exists to create.               */
             const t = maxVal > 0 ? Math.min(1, c.value / maxVal) : 0;
-            /* REPLACED the old pow(t,6)*0.65 curve (2026-08-21) — it was tuned for a          */
-            /* completely different goal (a soft glow where only the hot core should read as   */
-            /* solid, everything else dissipates) that no longer applies now that the field is  */
-            /* meant to look like a real multi-band heatmap (distinct visible color at every    */
-            /* density level, matching real KDE/contour tools). That exponent-6 curve was so     */
-            /* steep it made every band except the very peak nearly invisible — verified         */
-            /* numerically, accounting for how the 22 nested threshold bands actually composite  */
-            /* together (effective opacity = 1 - product(1-alpha) across every band whose        */
-            /* threshold the point clears): the old curve gave ~1.6% effective opacity at t=0.5   */
-            /* and ~8% at t=0.7 — exactly "I don't see the other colors, just a stain with a      */
-            /* halo". This curve was tuned the same way (composited, not just the raw per-band    */
-            /* value) to land near 18%/40%/64%/85% effective opacity at t=0.2/0.5/0.85/1.0 —      */
-            /* every band clearly visible, peak strong but still short of fully solid so          */
-            /* epicenter markers stay the highest-contrast thing on top of it.                    */
-            const alpha = 0.025 + Math.pow(t, 1.1) * 0.11;
+            /* REPLACED AGAIN (2026-08-21, second pass) — the first replacement fixed the       */
+            /* "invisible bands" problem but produced a different one: one smooth blended blob   */
+            /* instead of distinct rings, because it kept the "many thin overlapping bands        */
+            /* stack into visibility" model, just with different numbers. That model can only     */
+            /* ever look smooth, no matter how it's tuned — stacking translucent layers IS a       */
+            /* blur/blend operation. A real contour plot's tiers look distinct because each band   */
+            /* is mostly OPAQUE and simply paints over what's beneath it, so the topmost (highest, */
+            /* smallest) band at any point wins outright instead of blending with the rest. With   */
+            /* only 7 bands now (see computeDensityContours), each needs real weight on its own —  */
+            /* ranges roughly 0.39 (outermost, still clearly its own visible color) to 0.90         */
+            /* (innermost, strong but short of fully solid so epicenter markers stay on top).       */
+            const alpha = 0.35 + Math.pow(t, 1.3) * 0.55;
             return <path key={i} d={contourPath(c)} fill={densityRamp(C, t)} fillOpacity={alpha} stroke="none" />;
           })}
         </g>
